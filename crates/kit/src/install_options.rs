@@ -52,10 +52,6 @@ pub struct InstallOptions {
     /// backend
     #[clap(long, requires = "composefs_backend")]
     pub allow_missing_fsverity: bool,
-
-    /// Path to an authorized_keys file to inject into the root account
-    #[clap(long)]
-    pub root_ssh_authorized_keys: Option<Utf8PathBuf>,
 }
 
 impl InstallOptions {
@@ -93,11 +89,6 @@ impl InstallOptions {
 
         if self.allow_missing_fsverity {
             args.push("--allow-missing-fsverity".into());
-        }
-
-        if let Some(ref key_path) = self.root_ssh_authorized_keys {
-            args.push("--root-ssh-authorized-keys".to_string());
-            args.push(key_path.to_string());
         }
 
         args
