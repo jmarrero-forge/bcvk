@@ -5,8 +5,7 @@ ALL_BASE_IMAGES := "quay.io/fedora/fedora-bootc:43 quay.io/fedora/fedora-bootc:4
 
 # Build the native binary (cross-compiles NBD server on non-Linux hosts)
 build:
-    make nbd-server
-    make bin
+   make
 
 # Static checks
 validate:

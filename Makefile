@@ -4,10 +4,21 @@ SOURCE_DATE_EPOCH ?= $(shell git log -1 --pretty=%ct)
 # https://reproducible-builds.org/docs/archives/
 TAR_REPRODUCIBLE = tar --mtime="@${SOURCE_DATE_EPOCH}" --sort=name --owner=0 --group=0 --numeric-owner --pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime
 
-all: bin manpages
+UNAME_S := $(shell uname -s)
 
+ifeq ($(UNAME_S),Linux)
+all: bin manpages
+else
+# The man pages document the Linux command line
+all: bin
+endif
+
+# The workspace check is Linux only: bcvk-nbd builds only for Linux
 .PHONY: bin
-bin:
+bin: nbd-server
+ifeq ($(UNAME_S),Linux)
+	cargo check --workspace
+endif
 	cargo build --release
 
 # Generate man pages from markdown sources
@@ -64,7 +75,7 @@ NBD_TARGET := $(NBD_ARCH)-unknown-linux-gnu
 
 .PHONY: nbd-server
 nbd-server:
-ifneq ($(shell uname -s),Linux)
+ifneq ($(UNAME_S),Linux)
 	PATH="$(HOME)/.rustup/toolchains/stable-$(shell rustc -vV | awk '/^host:/ {print $$2}')/bin:$(HOME)/.cargo/bin:$(PATH)" \
 	  cargo zigbuild --target $(NBD_TARGET) --release -p bcvk-nbd
 	mkdir -p target/nbd-server
