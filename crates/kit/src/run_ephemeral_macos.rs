@@ -116,7 +116,9 @@ impl Drop for VmCleanup {
     fn drop(&mut self) {
         tracing::debug!("cleaning up VM processes...");
         // Stop the VM before the NBD server backing its root filesystem.
-        crate::vm_helpers::stop_vm_processes(self.vfkit_pid, self.gvproxy_pid, false);
+        // Its root is a read-only export, so there's no clean shutdown to
+        // wait for.
+        crate::vm_helpers::stop_vm_processes(self.vfkit_pid, self.gvproxy_pid, true);
         if let Some(ref name) = self.nbd_unit {
             crate::nbd_macos::stop_nbd_server(name, self.nbd_port);
         }

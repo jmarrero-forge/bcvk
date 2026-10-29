@@ -473,7 +473,12 @@ pub fn bcvk_base_dir() -> PathBuf {
 }
 
 /// How long vfkit gets to exit after SIGTERM before it is killed.
-pub const VFKIT_STOP_TIMEOUT: Duration = Duration::from_secs(1);
+///
+/// On SIGTERM vfkit asks the guest to power off and, if it hasn't after
+/// 5 seconds, stops it itself
+/// (<https://github.com/crc-org/vfkit/blob/9a585dc83f9d4c35f537ecf3cd2c0eb5ac6e4d0b/pkg/util/exithandler.go#L38-L52>).
+/// This leaves room for that, plus vfkit's own exit.
+const VFKIT_STOP_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// How long gvproxy gets to exit (and remove its sockets) after SIGTERM.
 const GVPROXY_STOP_TIMEOUT: Duration = Duration::from_secs(2);

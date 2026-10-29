@@ -32,10 +32,11 @@ pub fn run(opts: VmRmOpts) -> Result<()> {
                 opts.name
             );
         }
-        info!("force stopping VM '{}'...", opts.name);
+        info!("stopping VM '{}'...", opts.name);
+        // --stop shuts the guest down cleanly, --force kills it
         crate::vfkit::stop::run(crate::vfkit::stop::VmStopOpts {
             name: opts.name.clone(),
-            force: true,
+            force: opts.force,
         })?;
     }
 

@@ -132,8 +132,9 @@ fn cmd_rm_all(force: bool) -> Result<()> {
     }
 
     for vm in &vms {
-        // Stop the VM before the NBD server backing its root filesystem.
-        crate::vm_helpers::stop_vm_processes(vm.pid, vm.gvproxy_pid, false);
+        // Stop the VM before the NBD server backing its root filesystem,
+        // killing it outright as its root is a read-only export.
+        crate::vm_helpers::stop_vm_processes(vm.pid, vm.gvproxy_pid, true);
         if let Some(ref name) = vm.nbd_unit {
             crate::nbd_macos::stop_nbd_server(name, vm.nbd_port);
         }
