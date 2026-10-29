@@ -102,8 +102,12 @@ fn cmd_ps(json: bool) -> Result<()> {
     println!("{:<24} {:<50} SSH", "NAME", "IMAGE");
     for vm in &live {
         println!(
-            "{:<24} {:<50} ssh -p {} -i {} root@localhost",
-            vm.name, vm.image, vm.ssh_port, vm.ssh_key
+            "{:<24} {:<50} ssh -p {} -i {} root@{}",
+            vm.name,
+            vm.image,
+            vm.ssh_port,
+            vm.ssh_key,
+            crate::vm_helpers::FORWARD_LOCALHOST
         );
     }
     Ok(())
@@ -191,8 +195,9 @@ fn cmd_ssh(name: &str, args: &[String]) -> Result<()> {
     if std::path::Path::new(&svc_sock).exists() {
         if let Err(e) = crate::vm_helpers::expose_port(
             &svc_sock,
-            crate::vm_helpers::GVPROXY_VM_IP,
+            crate::vm_helpers::FORWARD_LOCALHOST,
             vm.ssh_port,
+            crate::vm_helpers::GVPROXY_VM_IP,
             22,
         ) {
             tracing::debug!("SSH port forward re-expose: {}", e);

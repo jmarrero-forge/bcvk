@@ -18,6 +18,13 @@ pub(crate) const GVPROXY_GATEWAY: &str = "gateway.containers.internal";
 /// VM device IP assigned by gvproxy DHCP static lease.
 pub(crate) const GVPROXY_VM_IP: &str = "192.168.127.2";
 
+/// Host address for forwards only bcvk itself connects to (SSH, NBD), so
+/// that they aren't reachable from the network.
+pub(crate) const FORWARD_LOCALHOST: &str = "127.0.0.1";
+
+/// Host address for forwards of user-requested ports: every interface.
+pub(crate) const FORWARD_ALL_INTERFACES: &str = "";
+
 /// SSH connection timeout (shared by wait_for_ssh).
 pub const SSH_TIMEOUT: Duration = Duration::from_secs(240);
 
@@ -91,7 +98,7 @@ pub fn ensure_image_and_get_digest(image: &str) -> Result<String> {
 /// Wait for SSH to become available on the given port.
 pub fn wait_for_ssh(port: u16, key_path: &Path, user: &str) -> Result<()> {
     let ssh_opts = CommonSshOptions::default();
-    let user_host = format!("{}@localhost", user);
+    let user_host = format!("{user}@{FORWARD_LOCALHOST}");
     info!("waiting for SSH on port {}...", port);
     let key_str = key_path.to_string_lossy().to_string();
     let (elapsed, _pb) = crate::utils::wait_for_readiness(
@@ -122,7 +129,7 @@ pub fn run_ssh_command(
     command: &str,
 ) -> Result<std::process::ExitStatus> {
     let ssh_opts = CommonSshOptions::default();
-    let user_host = format!("{}@localhost", user);
+    let user_host = format!("{user}@{FORWARD_LOCALHOST}");
     let mut cmd = Command::new("ssh");
     cmd.args(["-p", &port.to_string(), "-i", &key_path.to_string_lossy()]);
     ssh_opts.apply_to_command(&mut cmd);
@@ -141,7 +148,7 @@ pub fn run_ssh_interactive(
     user: &str,
 ) -> Result<std::process::ExitStatus> {
     let ssh_opts = CommonSshOptions::default();
-    let user_host = format!("{}@localhost", user);
+    let user_host = format!("{user}@{FORWARD_LOCALHOST}");
     let mut cmd = Command::new("ssh");
     cmd.args(["-p", &port.to_string(), "-i", &key_path.to_string_lossy()]);
     ssh_opts.apply_to_command(&mut cmd);
@@ -586,7 +593,13 @@ pub fn setup_ssh_port_forwarding(services_sock: &str, ssh_port: u16) -> Result<(
     crate::utils::wait_for_readiness(
         indicatif::ProgressBar::hidden(),
         "Setting up SSH port forwarding",
-        || match expose_port(services_sock, GVPROXY_VM_IP, ssh_port, 22) {
+        || match expose_port(
+            services_sock,
+            FORWARD_LOCALHOST,
+            ssh_port,
+            GVPROXY_VM_IP,
+            22,
+        ) {
             Ok(_) => Ok(true),
             Err(_) => Ok(false),
         },
@@ -754,18 +767,21 @@ fn http_status(response: &str) -> Option<u16> {
     fields.next()?.parse().ok()
 }
 
-/// Expose a TCP port forwarding rule via gvproxy's HTTP API.
+/// Forward TCP port `host_port` on `host_addr` (see [`FORWARD_LOCALHOST`]
+/// and [`FORWARD_ALL_INTERFACES`]) to `vm_ip:guest_port`, through gvproxy's
+/// HTTP API.
 pub fn expose_port(
     services_sock: &str,
-    vm_ip: &str,
+    host_addr: &str,
     host_port: u16,
+    vm_ip: &str,
     guest_port: u16,
 ) -> Result<()> {
     use std::io::{Read as _, Write as _};
     use std::os::unix::net::UnixStream;
 
     let body = serde_json::json!({
-        "local": format!(":{host_port}"),
+        "local": format!("{host_addr}:{host_port}"),
         "remote": format!("{vm_ip}:{guest_port}"),
         "protocol": "tcp",
     })

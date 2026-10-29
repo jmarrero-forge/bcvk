@@ -67,8 +67,10 @@ pub fn run(opts: VmInspectOpts) -> Result<()> {
     if state == "running" {
         println!();
         println!(
-            "  ssh -p {} -i {} root@localhost",
-            meta.ssh_port, meta.ssh_key
+            "  ssh -p {} -i {} root@{}",
+            meta.ssh_port,
+            meta.ssh_key,
+            crate::vm_helpers::FORWARD_LOCALHOST
         );
     }
     if !meta.labels.is_empty() {

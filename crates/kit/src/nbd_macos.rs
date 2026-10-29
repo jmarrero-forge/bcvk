@@ -39,22 +39,21 @@ pub(crate) fn start_nbd_server(
         &format!("--port {}", nbd_port),
     )?;
 
-    // macOS-specific: unexpose stale entry then expose via gvproxy's in-VM API
-    let gw = vm_helpers::GVPROXY_GATEWAY;
-    let vm_ip = vm_helpers::GVPROXY_VM_IP;
-    let unexpose_cmd = format!(
-        "curl -s -X POST http://{gw}:80/services/forwarder/unexpose \
-         -H 'Content-Type: application/json' \
-         -d '{{\"local\":\":{nbd_port}\",\"protocol\":\"tcp\"}}' >/dev/null 2>&1; true",
-    );
-    if let Err(e) = vm_helpers::machine_ssh(machine, &unexpose_cmd) {
+    // macOS-specific: unexpose a stale entry, if there is one, then expose
+    // via gvproxy's in-VM API
+    let unexpose_stale = format!("{}; true", unexpose_cmd(nbd_port));
+    if let Err(e) = vm_helpers::machine_ssh(machine, &unexpose_stale) {
         tracing::debug!("failed to unexpose port {}: {}", nbd_port, e);
     }
 
+    // -f: fail on an HTTP error, such as gvproxy refusing the forward
     let expose_cmd = format!(
-        "curl -s -X POST http://{gw}:80/services/forwarder/expose \
+        "curl -sf -X POST http://{gw}:80/services/forwarder/expose \
          -H 'Content-Type: application/json' \
-         -d '{{\"local\":\":{nbd_port}\",\"remote\":\"{vm_ip}:{nbd_port}\",\"protocol\":\"tcp\"}}'",
+         -d '{{\"local\":\"{local}\",\"remote\":\"{vm_ip}:{nbd_port}\",\"protocol\":\"tcp\"}}'",
+        gw = vm_helpers::GVPROXY_GATEWAY,
+        local = nbd_forward_local(nbd_port),
+        vm_ip = vm_helpers::GVPROXY_VM_IP,
     );
     let expose_cmd_clone = expose_cmd.clone();
     let machine_clone = machine.to_string();
@@ -114,22 +113,31 @@ pub fn find_available_nbd_port() -> u16 {
     vm_helpers::find_available_port_in_range(NBD_PORT_RANGE_START, NBD_PORT_RANGE_END)
 }
 
+/// The host side of the forward of an NBD port: localhost only, as just
+/// vfkit connects to it, and the export has no authentication.
+fn nbd_forward_local(nbd_port: u16) -> String {
+    format!("{}:{nbd_port}", vm_helpers::FORWARD_LOCALHOST)
+}
+
+/// Command removing the gvproxy forward of an NBD port, run in the podman
+/// machine; fails if gvproxy does.
+fn unexpose_cmd(nbd_port: u16) -> String {
+    format!(
+        "curl -sf -X POST http://{gw}:80/services/forwarder/unexpose \
+         -H 'Content-Type: application/json' \
+         -d '{{\"local\":\"{local}\",\"protocol\":\"tcp\"}}' >/dev/null 2>&1",
+        gw = vm_helpers::GVPROXY_GATEWAY,
+        local = nbd_forward_local(nbd_port),
+    )
+}
+
 /// Stop an NBD server and unexpose its gvproxy port (best-effort).
 pub fn stop_nbd_server(unit_name: &str, nbd_port: Option<u16>) {
     if let Ok(machine) = vm_helpers::detect_machine_name() {
         vm_helpers::stop_nbd_unit(&machine, unit_name);
         // macOS-specific: unexpose gvproxy port
         if let Some(port) = nbd_port {
-            if let Err(e) = vm_helpers::machine_ssh(
-                &machine,
-                &format!(
-                    "curl -sf -X POST http://{}:80/services/forwarder/unexpose \
-                     -H 'Content-Type: application/json' \
-                     -d '{{\"local\":\":{}\",\"protocol\":\"tcp\"}}'",
-                    vm_helpers::GVPROXY_GATEWAY,
-                    port
-                ),
-            ) {
+            if let Err(e) = vm_helpers::machine_ssh(&machine, &unexpose_cmd(port)) {
                 tracing::debug!("failed to unexpose port {}: {}", port, e);
             }
         }

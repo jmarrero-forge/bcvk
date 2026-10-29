@@ -254,8 +254,10 @@ pub fn run(opts: VmRunOpts) -> Result<()> {
 
     println!("VM '{}' is running", vm_name);
     println!(
-        "  ssh -p {} -i {} {}@localhost",
-        ssh_port, ssh_key_path, "root"
+        "  ssh -p {} -i {} root@{}",
+        ssh_port,
+        ssh_key_path,
+        crate::vm_helpers::FORWARD_LOCALHOST
     );
     println!();
     println!("To connect:  bcvk vm ssh {}", vm_name);

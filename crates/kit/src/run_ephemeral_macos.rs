@@ -311,9 +311,10 @@ fn run_vfkit(opts: RunEphemeralOpts) -> Result<()> {
         }
 
         info!(
-            "SSH ready: ssh -p {} -i {} root@localhost",
+            "SSH ready: ssh -p {} -i {} root@{}",
             ssh_port,
-            ssh_key_path.display()
+            ssh_key_path.display(),
+            crate::vm_helpers::FORWARD_LOCALHOST
         );
 
         use std::io::IsTerminal;

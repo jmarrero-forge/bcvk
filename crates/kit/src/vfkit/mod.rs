@@ -153,7 +153,7 @@ impl VmMetadata {
 pub(crate) fn launch(meta: &VmMetadata) -> Result<(Child, Child)> {
     use crate::vm_helpers::{
         expose_port, gvproxy_socket_paths, setup_ssh_port_forwarding, start_gvproxy,
-        stop_vm_processes, wait_for_ssh, GVPROXY_VM_IP,
+        stop_vm_processes, wait_for_ssh, FORWARD_ALL_INTERFACES, GVPROXY_VM_IP,
     };
 
     let (gvproxy_sock, services_sock) = gvproxy_socket_paths(&VmMetadata::vms_dir(), &meta.name);
@@ -185,7 +185,13 @@ pub(crate) fn launch(meta: &VmMetadata) -> Result<(Child, Child)> {
         info!("setting up SSH port forwarding...");
         setup_ssh_port_forwarding(&services_sock, meta.ssh_port)?;
         for &(host_port, guest_port) in &meta.port_mappings {
-            expose_port(&services_sock, GVPROXY_VM_IP, host_port, guest_port)?;
+            expose_port(
+                &services_sock,
+                FORWARD_ALL_INTERFACES,
+                host_port,
+                GVPROXY_VM_IP,
+                guest_port,
+            )?;
             info!("port {}:{} forwarded", host_port, guest_port);
         }
         wait_for_ssh(meta.ssh_port, Path::new(&meta.ssh_key), "root")

@@ -40,8 +40,10 @@ pub fn run(opts: VmStartOpts) -> Result<()> {
 
     println!("Started '{}'", meta.name);
     println!(
-        "  ssh -p {} -i {} {}@localhost",
-        meta.ssh_port, meta.ssh_key, "root"
+        "  ssh -p {} -i {} root@{}",
+        meta.ssh_port,
+        meta.ssh_key,
+        crate::vm_helpers::FORWARD_LOCALHOST
     );
 
     if opts.ssh {
