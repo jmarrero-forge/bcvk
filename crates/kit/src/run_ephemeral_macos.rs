@@ -16,7 +16,8 @@ use tracing::{debug, info};
 
 use crate::vm_helpers::{
     detect_machine_name, ensure_image_and_get_digest, find_available_ssh_port, is_machine_rootful,
-    run_ssh_command, run_ssh_interactive, start_gvproxy, wait_for_ssh, VmMetadataStore,
+    run_ssh_command, run_ssh_interactive, start_gvproxy, wait_for_ssh, TrackedProcess,
+    VmMetadataStore,
 };
 
 /// Base directory for ephemeral VM state on macOS host.
@@ -33,10 +34,13 @@ pub struct EphemeralVmMetadata {
     pub name: String,
     /// Container image reference used to boot the VM.
     pub image: String,
-    /// PID of the vfkit process.
-    pub pid: u32,
-    /// PID of the gvproxy network proxy process.
-    pub gvproxy_pid: u32,
+    /// The vfkit process; for a detached VM, until that is started, the
+    /// bcvk process starting it.
+    #[serde(default)]
+    pub vfkit: TrackedProcess,
+    /// The gvproxy network proxy process.
+    #[serde(default)]
+    pub gvproxy: TrackedProcess,
     /// Host-side SSH port forwarded to the VM.
     pub ssh_port: u16,
     /// Path to the SSH private key for this VM.
@@ -67,7 +71,7 @@ impl crate::vm_helpers::VmMetadataStore for EphemeralVmMetadata {
 impl EphemeralVmMetadata {
     /// Check if the VM process is still alive.
     pub fn is_alive(&self) -> bool {
-        crate::vm_helpers::process_alive(self.pid)
+        self.vfkit.is_running()
     }
 }
 
@@ -104,8 +108,8 @@ pub struct RunEphemeralOpts {
 // --- RAII cleanup guard ---
 
 struct VmCleanup {
-    vfkit_pid: u32,
-    gvproxy_pid: u32,
+    vfkit: TrackedProcess,
+    gvproxy: TrackedProcess,
     nbd_unit: Option<String>,
     nbd_port: Option<u16>,
     image: String,
@@ -118,7 +122,7 @@ impl Drop for VmCleanup {
         // Stop the VM before the NBD server backing its root filesystem.
         // Its root is a read-only export, so there's no clean shutdown to
         // wait for.
-        crate::vm_helpers::stop_vm_processes(self.vfkit_pid, self.gvproxy_pid, true);
+        crate::vm_helpers::stop_vm_processes(self.vfkit, self.gvproxy, true);
         if let Some(ref name) = self.nbd_unit {
             crate::nbd_macos::stop_nbd_server(name, self.nbd_port);
         }
@@ -222,8 +226,8 @@ fn run_vfkit(opts: RunEphemeralOpts) -> Result<()> {
 
     // Undoes everything from here on when this function returns, however it does.
     let mut cleanup = VmCleanup {
-        vfkit_pid: 0,
-        gvproxy_pid: 0,
+        vfkit: TrackedProcess::NONE,
+        gvproxy: TrackedProcess::NONE,
         nbd_unit: None,
         nbd_port: None,
         image: opts.image.clone(),
@@ -252,7 +256,7 @@ fn run_vfkit(opts: RunEphemeralOpts) -> Result<()> {
     let services_sock_str = services_sock.to_string_lossy().to_string();
     info!("starting gvproxy...");
     let gvproxy_child = start_gvproxy(&gvproxy_sock.to_string_lossy(), &services_sock_str)?;
-    cleanup.gvproxy_pid = gvproxy_child.id();
+    cleanup.gvproxy = TrackedProcess::new(gvproxy_child.id());
 
     let efi_store = cache_base.join(format!("{}-efi-vars", vm_name));
     let serial_log = cache_base.join(format!("{}-serial.log", vm_name));
@@ -277,7 +281,7 @@ fn run_vfkit(opts: RunEphemeralOpts) -> Result<()> {
     info!("launching vfkit...");
     let vfkit_log = cache_base.join(format!("{}-vfkit.log", vm_name));
     let mut vfkit_child = vfkit_config.spawn(Some(&vfkit_log))?;
-    cleanup.vfkit_pid = vfkit_child.id();
+    cleanup.vfkit = TrackedProcess::new(vfkit_child.id());
 
     let ssh_port = find_available_ssh_port();
     debug!("allocated SSH port: {}", ssh_port);
@@ -285,8 +289,8 @@ fn run_vfkit(opts: RunEphemeralOpts) -> Result<()> {
     let metadata = EphemeralVmMetadata {
         name: vm_name.clone(),
         image: opts.image.clone(),
-        pid: vfkit_child.id(),
-        gvproxy_pid: gvproxy_child.id(),
+        vfkit: cleanup.vfkit,
+        gvproxy: cleanup.gvproxy,
         ssh_port,
         ssh_key: ssh_key_path.to_string_lossy().to_string(),
         serial_log: serial_log.to_string_lossy().to_string(),
@@ -371,8 +375,8 @@ fn run_detached(opts: &RunEphemeralOpts) -> Result<()> {
     let metadata = EphemeralVmMetadata {
         name: vm_name.clone(),
         image: opts.image.clone(),
-        pid: child.id(),
-        gvproxy_pid: 0,
+        vfkit: TrackedProcess::new(child.id()),
+        gvproxy: TrackedProcess::NONE,
         ssh_port: 0,
         ssh_key: cache_base
             .join(format!("{}-key", vm_name))
@@ -400,8 +404,14 @@ mod tests {
         let meta = EphemeralVmMetadata {
             name: "test-vm".to_string(),
             image: "quay.io/fedora/fedora-bootc:42".to_string(),
-            pid: 12345,
-            gvproxy_pid: 12346,
+            vfkit: TrackedProcess {
+                pid: 12345,
+                started_us: 1_777_000_000_000_000,
+            },
+            gvproxy: TrackedProcess {
+                pid: 12346,
+                started_us: 1_777_000_000_000_001,
+            },
             ssh_port: 2222,
             ssh_key: "/tmp/test-key".to_string(),
             serial_log: "/tmp/test-serial.log".to_string(),
@@ -414,7 +424,8 @@ mod tests {
         let loaded: EphemeralVmMetadata = serde_json::from_str(&json).unwrap();
         assert_eq!(loaded.name, "test-vm");
         assert_eq!(loaded.image, "quay.io/fedora/fedora-bootc:42");
-        assert_eq!(loaded.pid, 12345);
+        assert_eq!(loaded.vfkit, meta.vfkit);
+        assert_eq!(loaded.gvproxy, meta.gvproxy);
         assert_eq!(loaded.nbd_unit.as_deref(), Some("bcvk-nbd-test-vm"));
         assert_eq!(loaded.ssh_port, 2222);
         assert_eq!(loaded.log_path.as_deref(), Some("/tmp/test-vfkit.log"));
@@ -427,8 +438,8 @@ mod tests {
         let meta = EphemeralVmMetadata {
             name: "roundtrip-vm".to_string(),
             image: "localhost/test:latest".to_string(),
-            pid: 999,
-            gvproxy_pid: 1000,
+            vfkit: TrackedProcess::NONE,
+            gvproxy: TrackedProcess::NONE,
             ssh_port: 2250,
             ssh_key: "/tmp/key".to_string(),
             serial_log: "/tmp/serial.log".to_string(),
@@ -454,8 +465,8 @@ mod tests {
             let meta = EphemeralVmMetadata {
                 name: format!("vm-{i}"),
                 image: "test:latest".to_string(),
-                pid: 100 + i,
-                gvproxy_pid: 200 + i,
+                vfkit: TrackedProcess::NONE,
+                gvproxy: TrackedProcess::NONE,
                 ssh_port: 2222 + (i as u16),
                 ssh_key: "/tmp/key".to_string(),
                 serial_log: "/tmp/serial.log".to_string(),

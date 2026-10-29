@@ -81,7 +81,7 @@ impl EphemeralCommands {
 }
 
 fn cmd_ps(json: bool) -> Result<()> {
-    let vms = EphemeralVmMetadata::list_all()?;
+    let vms = EphemeralVmMetadata::list_readable()?;
     for vm in &vms {
         if !vm.is_alive() {
             EphemeralVmMetadata::remove(&vm.name);
@@ -114,7 +114,7 @@ fn cmd_ps(json: bool) -> Result<()> {
 }
 
 fn cmd_rm_all(force: bool) -> Result<()> {
-    let vms = EphemeralVmMetadata::list_all()?;
+    let vms = EphemeralVmMetadata::list_readable()?;
     if vms.is_empty() {
         println!("No ephemeral VMs found.");
         return Ok(());
@@ -138,7 +138,7 @@ fn cmd_rm_all(force: bool) -> Result<()> {
     for vm in &vms {
         // Stop the VM before the NBD server backing its root filesystem,
         // killing it outright as its root is a read-only export.
-        crate::vm_helpers::stop_vm_processes(vm.pid, vm.gvproxy_pid, true);
+        crate::vm_helpers::stop_vm_processes(vm.vfkit, vm.gvproxy, true);
         if let Some(ref name) = vm.nbd_unit {
             crate::nbd_macos::stop_nbd_server(name, vm.nbd_port);
         }

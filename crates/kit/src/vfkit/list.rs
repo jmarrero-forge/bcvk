@@ -34,7 +34,7 @@ pub fn run(opts: VmListOpts) -> Result<()> {
             }
         }
     } else {
-        VmMetadata::list_all()?
+        VmMetadata::list_readable()?
     };
 
     let mut vms: Vec<_> = all_vms

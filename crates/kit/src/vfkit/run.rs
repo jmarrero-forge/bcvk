@@ -11,7 +11,7 @@ use super::{VmMetadata, VmMetadataStore};
 use crate::vm_helpers::{
     clear_xattr, detect_machine_name, ensure_image_and_get_digest, find_available_ssh_port,
     gvproxy_socket_paths, remove_file_if_exists, run_ssh_interactive, sanitize_vm_name,
-    validate_vm_name,
+    validate_vm_name, TrackedProcess,
 };
 
 /// Port mapping from host to VM (format: host_port:guest_port).
@@ -237,8 +237,8 @@ pub fn run(opts: VmRunOpts) -> Result<()> {
         name: vm_name.clone(),
         image: image_name,
         disk_image: disk_path_str.clone(),
-        vfkit_pid: 0,
-        gvproxy_pid: 0,
+        vfkit: TrackedProcess::NONE,
+        gvproxy: TrackedProcess::NONE,
         ssh_port,
         ssh_key: ssh_key_path.clone(),
         vcpus,
@@ -256,8 +256,8 @@ pub fn run(opts: VmRunOpts) -> Result<()> {
             .collect(),
     };
     let (vfkit_child, gvproxy_child) = super::launch(&metadata)?;
-    metadata.vfkit_pid = vfkit_child.id();
-    metadata.gvproxy_pid = gvproxy_child.id();
+    metadata.vfkit = TrackedProcess::new(vfkit_child.id());
+    metadata.gvproxy = TrackedProcess::new(gvproxy_child.id());
     metadata.save()?;
     let key_path = Path::new(&ssh_key_path);
 

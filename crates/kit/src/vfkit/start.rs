@@ -4,7 +4,7 @@ use clap::Parser;
 use color_eyre::{eyre::bail, Result};
 
 use super::{VmMetadata, VmMetadataStore};
-use crate::vm_helpers::{clear_xattr, run_ssh_interactive};
+use crate::vm_helpers::{clear_xattr, run_ssh_interactive, TrackedProcess};
 
 /// Options for `vm start`.
 #[derive(Parser, Debug)]
@@ -33,8 +33,8 @@ pub fn run(opts: VmStartOpts) -> Result<()> {
 
     meta.gui = opts.gui || meta.gui;
     let (vfkit_child, gvproxy_child) = super::launch(&meta)?;
-    meta.vfkit_pid = vfkit_child.id();
-    meta.gvproxy_pid = gvproxy_child.id();
+    meta.vfkit = TrackedProcess::new(vfkit_child.id());
+    meta.gvproxy = TrackedProcess::new(gvproxy_child.id());
     meta.state = "running".to_string();
     meta.save()?;
 

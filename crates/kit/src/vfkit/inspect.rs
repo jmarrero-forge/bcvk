@@ -46,10 +46,10 @@ pub fn run(opts: VmInspectOpts) -> Result<()> {
     println!("Created:    {}", meta.created);
     println!();
     println!("Processes:");
-    if meta.vfkit_pid > 0 {
+    if meta.vfkit.pid > 0 {
         println!(
             "  vfkit:    PID {} ({})",
-            meta.vfkit_pid,
+            meta.vfkit.pid,
             if meta.is_alive() {
                 "running"
             } else {
@@ -57,8 +57,8 @@ pub fn run(opts: VmInspectOpts) -> Result<()> {
             }
         );
     }
-    if meta.gvproxy_pid > 0 {
-        println!("  gvproxy:  PID {}", meta.gvproxy_pid);
+    if meta.gvproxy.pid > 0 {
+        println!("  gvproxy:  PID {}", meta.gvproxy.pid);
     }
     println!();
     println!("SSH:");

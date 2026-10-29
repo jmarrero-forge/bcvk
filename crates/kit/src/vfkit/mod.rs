@@ -10,6 +10,7 @@ use clap::Subcommand;
 use color_eyre::Result;
 use tracing::info;
 
+use crate::vm_helpers::TrackedProcess;
 pub use crate::vm_helpers::VmMetadataStore;
 
 pub mod inspect;
@@ -94,10 +95,12 @@ pub struct VmMetadata {
     pub image: Option<String>,
     /// Path to the disk image file.
     pub disk_image: String,
-    /// PID of the vfkit process.
-    pub vfkit_pid: u32,
-    /// PID of the gvproxy network proxy process.
-    pub gvproxy_pid: u32,
+    /// The vfkit process.
+    #[serde(default)]
+    pub vfkit: TrackedProcess,
+    /// The gvproxy network proxy process.
+    #[serde(default)]
+    pub gvproxy: TrackedProcess,
     /// Host-side SSH port forwarded to the VM.
     pub ssh_port: u16,
     /// Path to the SSH private key.
@@ -136,13 +139,13 @@ impl crate::vm_helpers::VmMetadataStore for VmMetadata {
 impl VmMetadata {
     /// Check if the VM process is still alive.
     pub fn is_alive(&self) -> bool {
-        crate::vm_helpers::process_alive(self.vfkit_pid)
+        self.vfkit.is_running()
     }
 
     /// Stop the VM's vfkit and gvproxy processes, see
     /// [`crate::vm_helpers::stop_vm_processes`].
     pub fn stop_processes(&self, force: bool) {
-        crate::vm_helpers::stop_vm_processes(self.vfkit_pid, self.gvproxy_pid, force);
+        crate::vm_helpers::stop_vm_processes(self.vfkit, self.gvproxy, force);
     }
 }
 
@@ -176,7 +179,11 @@ pub(crate) fn launch(meta: &VmMetadata) -> Result<(Child, Child)> {
     let vfkit = match config.spawn(None) {
         Ok(child) => child,
         Err(e) => {
-            stop_vm_processes(0, gvproxy.id(), true);
+            stop_vm_processes(
+                TrackedProcess::NONE,
+                TrackedProcess::new(gvproxy.id()),
+                true,
+            );
             return Err(e);
         }
     };
@@ -197,7 +204,11 @@ pub(crate) fn launch(meta: &VmMetadata) -> Result<(Child, Child)> {
         wait_for_ssh(meta.ssh_port, Path::new(&meta.ssh_key), "root")
     };
     if let Err(e) = connect() {
-        stop_vm_processes(vfkit.id(), gvproxy.id(), true);
+        stop_vm_processes(
+            TrackedProcess::new(vfkit.id()),
+            TrackedProcess::new(gvproxy.id()),
+            true,
+        );
         return Err(e);
     }
     Ok((vfkit, gvproxy))
@@ -213,8 +224,8 @@ mod tests {
             name: name.to_string(),
             image: None,
             disk_image: "/tmp/disk.raw".to_string(),
-            vfkit_pid: 0,
-            gvproxy_pid: 0,
+            vfkit: TrackedProcess::NONE,
+            gvproxy: TrackedProcess::NONE,
             ssh_port: 2222,
             ssh_key: "/tmp/key".to_string(),
             vcpus: 2,

@@ -20,7 +20,7 @@ pub struct VmRmAllOpts {
 
 /// Remove all persistent VMs, with optional label filtering.
 pub fn run(opts: VmRmAllOpts) -> Result<()> {
-    let mut vms = VmMetadata::list_all()?;
+    let mut vms = VmMetadata::list_readable()?;
 
     if let Some(ref filter_label) = opts.label {
         vms.retain(|v| v.labels.contains(filter_label));

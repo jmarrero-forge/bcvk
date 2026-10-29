@@ -446,6 +446,10 @@ pub fn find_vfkit() -> Result<String> {
     Err(eyre!("vfkit not found. Install: brew install vfkit"))
 }
 
+/// Process ID fields of the metadata saved by earlier builds of this
+/// backend, see [`VmMetadataStore::parse`].
+const LEGACY_PID_KEYS: &[&str] = &["pid", "vfkit_pid", "gvproxy_pid"];
+
 /// Shared persistence methods for VM metadata types.
 ///
 /// Implementors provide `vms_dir()` and `name()`, getting JSON-backed
@@ -474,10 +478,42 @@ pub trait VmMetadataStore: serde::Serialize + serde::de::DeserializeOwned + Size
 
     /// Load metadata for the named VM from its JSON file.
     fn load(name: &str) -> color_eyre::Result<Self> {
+        Self::load_if_exists(name)?.ok_or_else(|| eyre!("no VM named '{name}'"))
+    }
+
+    /// Load metadata for the named VM, if it has any.
+    fn load_if_exists(name: &str) -> color_eyre::Result<Option<Self>> {
         let path = Self::metadata_path(name)?;
-        let data = std::fs::read_to_string(&path)
-            .with_context(|| format!("reading metadata of VM '{name}'"))?;
-        serde_json::from_str(&data).with_context(|| format!("parsing {}", path.display()))
+        match std::fs::read_to_string(&path) {
+            Ok(data) => Self::parse(&path, &data).map(Some),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+        }
+    }
+
+    /// Parse the metadata read from `path`.
+    ///
+    /// Metadata saved by earlier builds of this backend identifies the
+    /// VM's processes by PID alone, so whether they are still its own
+    /// can't be told; rather than treat such a VM as stopped and start
+    /// over it or tear down its NBD server, this fails, saying what to
+    /// clean up by hand.
+    fn parse(path: &Path, data: &str) -> color_eyre::Result<Self> {
+        let value: serde_json::Value =
+            serde_json::from_str(data).with_context(|| format!("parsing {}", path.display()))?;
+        let pids: Vec<String> = LEGACY_PID_KEYS
+            .iter()
+            .filter_map(|&key| Some(format!("{key} {}", value.get(key)?)))
+            .collect();
+        if !pids.is_empty() {
+            bail!(
+                "{} was saved by an earlier bcvk build, which didn't record when the VM's \
+                 processes started: stop them if they still run ({}), then remove the file",
+                path.display(),
+                pids.join(", ")
+            );
+        }
+        serde_json::from_value(value).with_context(|| format!("parsing {}", path.display()))
     }
 
     /// Remove metadata file for the named VM.
@@ -488,26 +524,47 @@ pub trait VmMetadataStore: serde::Serialize + serde::de::DeserializeOwned + Size
         }
     }
 
-    /// List all VM metadata from the VMs directory.
-    fn list_all() -> color_eyre::Result<Vec<Self>> {
-        let dir = Self::vms_dir();
-        if !dir.exists() {
-            return Ok(Vec::new());
-        }
-        let mut items = Vec::new();
-        for entry in std::fs::read_dir(&dir)? {
-            let path = entry?.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            if let Ok(data) = std::fs::read_to_string(&path) {
-                if let Ok(meta) = serde_json::from_str::<Self>(&data) {
-                    items.push(meta);
-                }
-            }
-        }
-        Ok(items)
+    /// The metadata of every VM that can be read, warning about the
+    /// rest, for commands that only list VMs or act on each.
+    fn list_readable() -> color_eyre::Result<Vec<Self>> {
+        Ok(read_all_metadata(&Self::vms_dir())?
+            .into_iter()
+            .filter_map(|(path, meta)| {
+                meta.inspect_err(|e| tracing::warn!("ignoring {}: {e}", path.display()))
+                    .ok()
+            })
+            .collect())
     }
+}
+
+/// Read every VM metadata file in `dir`: its path, and the metadata or the
+/// error reading it.
+pub(crate) fn read_all_metadata<T: VmMetadataStore>(
+    dir: &Path,
+) -> color_eyre::Result<Vec<(PathBuf, color_eyre::Result<T>)>> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
+    };
+    let mut items = Vec::new();
+    for entry in entries {
+        let path = entry
+            .with_context(|| format!("reading {}", dir.display()))?
+            .path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let meta = match std::fs::read_to_string(&path) {
+            // Removed since it was listed, its VM gone meanwhile
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            data => data
+                .with_context(|| format!("reading {}", path.display()))
+                .and_then(|data| T::parse(&path, &data)),
+        };
+        items.push((path, meta));
+    }
+    Ok(items)
 }
 
 /// Base directory for bcvk persistent state: `~/.local/share/bcvk`.
@@ -540,6 +597,69 @@ fn to_pid(pid: u32) -> Option<rustix::process::Pid> {
         .and_then(rustix::process::Pid::from_raw)
 }
 
+/// When the process with this PID started, in microseconds since the
+/// epoch, or None if there is no such process (of ours).
+#[allow(unsafe_code)]
+fn process_start_time(pid: u32) -> Option<u64> {
+    let pid = i32::try_from(pid).ok().filter(|&pid| pid > 0)?;
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: proc_pidinfo writes at most `size` bytes to `info`, which
+    // has that size.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if written != size {
+        return None;
+    }
+    // SAFETY: proc_pidinfo filled in all of it, and any bytes are valid
+    // for this plain C struct.
+    let info = unsafe { info.assume_init() };
+    Some(info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
+}
+
+/// A process bcvk started, as recorded in VM metadata.
+///
+/// Its start time tells it apart from any later process that gets the
+/// same PID, after the Mac rebooted say, so that bcvk never signals, or
+/// reports as a running VM, a process it didn't start.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TrackedProcess {
+    /// Process ID; 0 for none.
+    pub pid: u32,
+    /// Start time in microseconds since the epoch.
+    pub started_us: u64,
+}
+
+impl TrackedProcess {
+    /// No process.
+    pub const NONE: Self = Self {
+        pid: 0,
+        started_us: 0,
+    };
+
+    /// Track a process just started, such as a [`std::process::Child`].
+    pub fn new(pid: u32) -> Self {
+        match process_start_time(pid) {
+            Some(started_us) => Self { pid, started_us },
+            // It already exited
+            None => Self::NONE,
+        }
+    }
+
+    /// Whether this process is still running; reaps it if it is an
+    /// exited child of ours, see [`has_exited`].
+    pub fn is_running(&self) -> bool {
+        !has_exited(self.pid) && process_start_time(self.pid) == Some(self.started_us)
+    }
+}
+
 /// Whether the process has exited (a zero PID never refers to one).
 ///
 /// A child of ours that exited is reaped here, so it isn't mistaken
@@ -561,18 +681,12 @@ fn has_exited(pid: u32) -> bool {
     }
 }
 
-/// Whether a process with this PID is running; reaps it if it is an
-/// exited child of ours, see [`has_exited`].
-pub fn process_alive(pid: u32) -> bool {
-    !has_exited(pid)
-}
-
 /// Wait for a process to exit.
 /// Returns true if process exited within timeout, false otherwise.
-fn wait_for_process_exit(pid: u32, timeout: Duration) -> bool {
+fn wait_for_process_exit(process: TrackedProcess, timeout: Duration) -> bool {
     let start = std::time::Instant::now();
     loop {
-        if has_exited(pid) {
+        if !process.is_running() {
             return true;
         }
         if start.elapsed() >= timeout {
@@ -594,13 +708,23 @@ fn send_signal(pid: u32, what: &str, signal: rustix::process::Signal) {
 
 /// Stop a process with SIGTERM, escalating to SIGKILL if it is still
 /// running after `timeout`; with `force`, SIGKILL it right away.
-fn terminate_process(pid: u32, what: &str, timeout: Duration, force: bool) {
-    if has_exited(pid) {
+///
+/// Does nothing once the process is gone, which, as its identity is
+/// checked before each signal, includes its PID belonging to another
+/// process by now.
+fn terminate_process(process: TrackedProcess, what: &str, timeout: Duration, force: bool) {
+    let pid = process.pid;
+    if !process.is_running() {
         return;
     }
     if !force {
         send_signal(pid, what, rustix::process::Signal::TERM);
-        if wait_for_process_exit(pid, timeout) {
+        if wait_for_process_exit(process, timeout) {
+            return;
+        }
+        // Checked again right before the signal, like above: it may have
+        // exited, and its PID gone to another process, since the last poll
+        if !process.is_running() {
             return;
         }
         info!(
@@ -609,7 +733,7 @@ fn terminate_process(pid: u32, what: &str, timeout: Duration, force: bool) {
         );
     }
     send_signal(pid, what, rustix::process::Signal::KILL);
-    if !wait_for_process_exit(pid, KILL_WAIT_TIMEOUT) {
+    if !wait_for_process_exit(process, KILL_WAIT_TIMEOUT) {
         tracing::warn!("{what} (PID {pid}) did not exit after SIGKILL");
     }
 }
@@ -618,9 +742,9 @@ fn terminate_process(pid: u32, what: &str, timeout: Duration, force: bool) {
 ///
 /// vfkit goes first since the guest may still use the network while it
 /// shuts down. With `force`, both processes are killed outright.
-pub fn stop_vm_processes(vfkit_pid: u32, gvproxy_pid: u32, force: bool) {
-    terminate_process(vfkit_pid, "vfkit", VFKIT_STOP_TIMEOUT, force);
-    terminate_process(gvproxy_pid, "gvproxy", GVPROXY_STOP_TIMEOUT, force);
+pub fn stop_vm_processes(vfkit: TrackedProcess, gvproxy: TrackedProcess, force: bool) {
+    terminate_process(vfkit, "vfkit", VFKIT_STOP_TIMEOUT, force);
+    terminate_process(gvproxy, "gvproxy", GVPROXY_STOP_TIMEOUT, force);
 }
 
 /// Set up SSH port forwarding via gvproxy with retry.
@@ -735,7 +859,7 @@ pub fn start_gvproxy(gvproxy_sock: &str, services_sock: &str) -> Result<std::pro
         Duration::from_secs(5),
         Duration::from_millis(100),
     ) {
-        stop_vm_processes(0, child.id(), true);
+        stop_vm_processes(TrackedProcess::NONE, TrackedProcess::new(child.id()), true);
         return Err(e.wrap_err(format!("gvproxy didn't create {gvproxy_sock}")));
     }
     Ok(child)
@@ -1017,15 +1141,111 @@ mod tests {
     }
 
     #[test]
-    fn test_process_alive() {
-        assert!(process_alive(std::process::id()));
-        assert!(!process_alive(0));
-        let mut child = Command::new("true").spawn().unwrap();
-        let pid = child.id();
-        assert!(wait_for_process_exit(pid, Duration::from_secs(10)));
-        assert!(!process_alive(pid));
+    fn test_tracked_process() {
+        let me = TrackedProcess::new(std::process::id());
+        assert_eq!(me.pid, std::process::id());
+        assert!(me.is_running());
+        assert_eq!(TrackedProcess::new(std::process::id()), me);
+        assert!(!TrackedProcess::NONE.is_running());
+        // Same PID, but started at another time: some other process
+        for started_us in [me.started_us - 1, me.started_us + 1, 0] {
+            let other = TrackedProcess { started_us, ..me };
+            assert!(!other.is_running(), "{other:?}");
+            // ... which is never signalled
+            terminate_process(other, "test", Duration::ZERO, true);
+        }
+        assert!(me.is_running());
+
+        let mut child = Command::new("sleep").arg("60").spawn().unwrap();
+        let tracked = TrackedProcess::new(child.id());
+        assert!(tracked.is_running());
+        terminate_process(tracked, "sleep", Duration::from_secs(10), false);
+        assert!(!tracked.is_running());
         // has_exited() reaped it already
         assert!(child.wait().is_err());
+    }
+
+    #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
+    struct TestMetadata {
+        name: String,
+        #[serde(default)]
+        vfkit: TrackedProcess,
+    }
+
+    impl VmMetadataStore for TestMetadata {
+        fn vms_dir() -> PathBuf {
+            unreachable!()
+        }
+        fn name(&self) -> &str {
+            &self.name
+        }
+    }
+
+    #[test]
+    fn test_metadata_parse() {
+        let path = Path::new("/vms/vm.json");
+        let vm = TestMetadata::parse(
+            path,
+            r#"{"name": "vm", "vfkit": {"pid": 12, "started_us": 34}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            vm.vfkit,
+            TrackedProcess {
+                pid: 12,
+                started_us: 34
+            }
+        );
+        // Earlier builds' PIDs without start times
+        for data in [
+            r#"{"name": "vm", "pid": 12, "gvproxy_pid": 13}"#,
+            r#"{"name": "vm", "vfkit_pid": 12, "gvproxy_pid": 13}"#,
+        ] {
+            let err = TestMetadata::parse(path, data).unwrap_err().to_string();
+            assert!(
+                err.contains("gvproxy_pid 13") && err.contains("/vms/vm.json"),
+                "{err}"
+            );
+        }
+        assert!(TestMetadata::parse(path, "{").is_err());
+    }
+
+    #[test]
+    fn test_read_all_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_all_metadata::<TestMetadata>(&dir.path().join("none"))
+            .unwrap()
+            .is_empty());
+        // Stands in for a file removed between listing and reading it
+        std::os::unix::fs::symlink(dir.path().join("gone"), dir.path().join("gone.json")).unwrap();
+        for (file, data) in [
+            ("ok.json", r#"{"name": "ok"}"#),
+            ("legacy.json", r#"{"name": "legacy", "pid": 12}"#),
+            ("broken.json", "{"),
+            ("notes.txt", "not metadata"),
+        ] {
+            std::fs::write(dir.path().join(file), data).unwrap();
+        }
+        let mut found: Vec<_> = read_all_metadata::<TestMetadata>(dir.path())
+            .unwrap()
+            .into_iter()
+            .map(|(path, meta)| {
+                let file = path.file_name().unwrap().to_string_lossy().into_owned();
+                (file, meta.map(|m| m.name).map_err(|e| e.to_string()))
+            })
+            .collect();
+        found.sort();
+        let [(broken, Err(broken_err)), (legacy, Err(legacy_err)), (ok, Ok(ok_name))] = &found[..]
+        else {
+            panic!("{found:?}");
+        };
+        assert_eq!(
+            (&**broken, &**legacy, &**ok, &**ok_name),
+            ("broken.json", "legacy.json", "ok.json", "ok")
+        );
+        // Each error names its file
+        assert!(broken_err.contains("broken.json"), "{broken_err}");
+        assert!(legacy_err.contains("legacy.json"), "{legacy_err}");
     }
 
     #[test]

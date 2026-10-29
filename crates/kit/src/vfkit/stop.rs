@@ -25,8 +25,8 @@ pub fn run(opts: VmStopOpts) -> Result<()> {
     meta.stop_processes(opts.force);
 
     meta.state = "stopped".to_string();
-    meta.vfkit_pid = 0;
-    meta.gvproxy_pid = 0;
+    meta.vfkit = crate::vm_helpers::TrackedProcess::NONE;
+    meta.gvproxy = crate::vm_helpers::TrackedProcess::NONE;
     meta.save()?;
 
     println!("Stopped '{}'", opts.name);
