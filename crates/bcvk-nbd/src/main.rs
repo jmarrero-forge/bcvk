@@ -7,7 +7,9 @@ pub mod nbd;
 pub mod regions;
 
 use std::net::TcpListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use cap_std::fs::Dir;
 
 use regions::Region;
 
@@ -84,39 +86,66 @@ fn parse_args() -> Args {
     args
 }
 
-fn find_kernel_dir(dir: &std::path::Path) -> Option<(PathBuf, PathBuf)> {
-    let modules = dir.join("usr/lib/modules");
-    if let Ok(entries) = std::fs::read_dir(&modules) {
-        for entry in entries.flatten() {
-            let kdir = entry.path();
-            let vmlinuz = kdir.join("vmlinuz");
-            let initramfs = kdir.join("initramfs.img");
-            if vmlinuz.exists() && initramfs.exists() {
-                return Some((vmlinuz, initramfs));
-            }
+/// Where the image's kernels are, relative to its root.
+const MODULES_DIR: &str = "usr/lib/modules";
+/// Where to look for the GRUB EFI binary, relative to the image's root.
+const GRUB_SEARCH_DIR: &str = "usr/lib";
+/// GRUB EFI binary names, in order of preference.
+const GRUB_NAMES: [&str; 2] = ["grubaa64.efi", "grubx64.efi"];
+
+// The boot files are looked up through `root`, the image directory opened
+// with cap-std, which resolves symlinks only within the image and fails on
+// one leading out of it (an absolute one, say, which the server would
+// otherwise resolve on the podman machine and export). So a path found
+// this way names the same file when the server later opens it under the
+// image directory, and it can't make the server export a file of the
+// podman machine.
+
+/// Whether `path` is a regular file in the image (following symlinks
+/// within it).
+fn is_image_file(root: &Dir, path: &Path) -> bool {
+    root.metadata(path).map(|m| m.is_file()).unwrap_or(false)
+}
+
+/// The kernel and initramfs, relative to the image root.
+fn find_kernel_dir(root: &Dir) -> Option<(PathBuf, PathBuf)> {
+    let modules = Path::new(MODULES_DIR);
+    for entry in root.read_dir(modules).ok()?.flatten() {
+        let kdir = modules.join(entry.file_name());
+        let vmlinuz = kdir.join("vmlinuz");
+        let initramfs = kdir.join("initramfs.img");
+        if is_image_file(root, &vmlinuz) && is_image_file(root, &initramfs) {
+            return Some((vmlinuz, initramfs));
         }
     }
     None
 }
 
-fn find_grub(dir: &std::path::Path) -> Option<PathBuf> {
-    fn walk(path: &std::path::Path, target: &str) -> Option<PathBuf> {
-        if let Ok(entries) = std::fs::read_dir(path) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p.is_file() && p.file_name().map(|n| n == target).unwrap_or(false) {
-                    return Some(p);
-                }
-                if p.is_dir() {
-                    if let Some(found) = walk(&p, target) {
+/// The GRUB EFI binary, relative to the image root.
+///
+/// Only real directories are searched, so a symlink to a directory can't
+/// lead the search out of the image or around in a loop.
+fn find_grub(root: &Dir) -> Option<PathBuf> {
+    fn walk(root: &Dir, path: &Path, target: &str) -> Option<PathBuf> {
+        for entry in root.read_dir(path).ok()?.flatten() {
+            let p = path.join(entry.file_name());
+            match entry.file_type() {
+                Ok(ft) if ft.is_dir() => {
+                    if let Some(found) = walk(root, &p, target) {
                         return Some(found);
                     }
                 }
+                Ok(_) if entry.file_name().to_str() == Some(target) && is_image_file(root, &p) => {
+                    return Some(p);
+                }
+                _ => {}
             }
         }
         None
     }
-    walk(&dir.join("usr/lib"), "grubaa64.efi").or_else(|| walk(&dir.join("usr/lib"), "grubx64.efi"))
+    GRUB_NAMES
+        .iter()
+        .find_map(|name| walk(root, Path::new(GRUB_SEARCH_DIR), name))
 }
 
 fn file_size(path: &std::path::Path) -> u64 {
@@ -130,8 +159,7 @@ fn file_size(path: &std::path::Path) -> u64 {
 }
 
 fn build_disk(args: &Args) -> (Vec<Region>, u64) {
-    let root_dir = match cap_std::fs::Dir::open_ambient_dir(&args.dir, cap_std::ambient_authority())
-    {
+    let root_dir = match Dir::open_ambient_dir(&args.dir, cap_std::ambient_authority()) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("failed to open directory {:?}: {}", args.dir, e);
@@ -164,22 +192,23 @@ fn build_disk(args: &Args) -> (Vec<Region>, u64) {
             }
         };
 
-    let (kernel_path, initrd_path) = match find_kernel_dir(&args.dir) {
-        Some(paths) => paths,
+    let (kernel_path, initrd_path) = match find_kernel_dir(&root_dir) {
+        Some((kernel, initrd)) => (args.dir.join(kernel), args.dir.join(initrd)),
         None => {
             eprintln!(
-                "kernel/initramfs not found in {}/usr/lib/modules/",
+                "kernel/initramfs not found in {}/{MODULES_DIR}/",
                 args.dir.display()
             );
             std::process::exit(1);
         }
     };
 
-    let grub_path = match find_grub(&args.dir) {
-        Some(p) => p,
+    let grub_path = match find_grub(&root_dir) {
+        Some(p) => args.dir.join(p),
         None => {
             eprintln!(
-                "grubaa64.efi/grubx64.efi not found in {}/usr/lib/",
+                "{} not found in {}/{GRUB_SEARCH_DIR}/",
+                GRUB_NAMES.join("/"),
                 args.dir.display()
             );
             std::process::exit(1);
@@ -250,5 +279,105 @@ fn main() {
         });
         eprintln!("bcvk-nbd: listening on TCP port {port}");
         nbd::serve_tcp(listener, device);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    /// An image directory with the given files and symlinks, and a regular
+    /// file outside of it, at `outside`.
+    fn image(files: &[&str], symlinks: &[(&str, &str)]) -> (tempfile::TempDir, Dir) {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("outside"), b"secret").unwrap();
+        let root = tmp.path().join("root");
+        for f in files {
+            let p = root.join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, b"data").unwrap();
+        }
+        for (link, target) in symlinks {
+            let p = root.join(link);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            let target = target.replace("@OUTSIDE@", &tmp.path().join("outside").to_string_lossy());
+            symlink(target, p).unwrap();
+        }
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        (tmp, dir)
+    }
+
+    const K: &str = "usr/lib/modules/6.1";
+
+    #[test]
+    fn test_find_kernel_dir() {
+        let vmlinuz = format!("{K}/vmlinuz");
+        let initramfs = format!("{K}/initramfs.img");
+        let expected = Some((PathBuf::from(&vmlinuz), PathBuf::from(&initramfs)));
+        for (files, symlinks, expected) in [
+            (
+                vec![vmlinuz.as_str(), initramfs.as_str()],
+                vec![],
+                expected.clone(),
+            ),
+            // A symlink within the image is fine
+            (
+                vec![initramfs.as_str(), "boot/vmlinuz-6.1"],
+                vec![(vmlinuz.as_str(), "../../../../boot/vmlinuz-6.1")],
+                expected.clone(),
+            ),
+            // One leading out of the image is not, absolute or relative
+            (
+                vec![initramfs.as_str()],
+                vec![(vmlinuz.as_str(), "@OUTSIDE@")],
+                None,
+            ),
+            (
+                vec![initramfs.as_str()],
+                vec![(vmlinuz.as_str(), "../../../../../outside")],
+                None,
+            ),
+            (vec![initramfs.as_str()], vec![], None),
+        ] {
+            let (_tmp, root) = image(&files, &symlinks);
+            assert_eq!(find_kernel_dir(&root), expected, "{files:?} {symlinks:?}");
+        }
+    }
+
+    #[test]
+    fn test_find_grub() {
+        let grub = "usr/lib/efi/grub2/EFI/fedora/grubx64.efi";
+        for (files, symlinks, expected) in [
+            (vec![grub], vec![], Some(grub)),
+            // grubaa64.efi wins
+            (
+                vec![grub, "usr/lib/efi/grubaa64.efi"],
+                vec![],
+                Some("usr/lib/efi/grubaa64.efi"),
+            ),
+            // A symlink to a file outside, and a loop, are skipped
+            (
+                vec![],
+                vec![
+                    ("usr/lib/a/grubx64.efi", "@OUTSIDE@"),
+                    ("usr/lib/loop", "."),
+                ],
+                None,
+            ),
+            // Symlinked directories aren't searched
+            (
+                vec!["usr/share/grubx64.efi"],
+                vec![("usr/lib/share", "../share")],
+                None,
+            ),
+        ] {
+            let (_tmp, root) = image(&files, &symlinks);
+            assert_eq!(
+                find_grub(&root),
+                expected.map(PathBuf::from),
+                "{files:?} {symlinks:?}"
+            );
+        }
     }
 }
