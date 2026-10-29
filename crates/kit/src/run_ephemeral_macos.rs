@@ -353,20 +353,8 @@ fn run_detached(opts: &RunEphemeralOpts) -> Result<()> {
     let log_file = fs::File::create(&log_path)?;
 
     let exe = std::env::current_exe()?;
-    let mut args: Vec<String> = std::env::args()
-        .skip(1)
-        .filter(|a| a != "--detach" && a != "-d")
-        .collect();
-    if !args.contains(&"-K".to_string()) && !args.contains(&"--ssh-keygen".to_string()) {
-        args.insert(args.len() - 1, "-K".to_string());
-    }
-    if opts.name.is_none() {
-        args.insert(args.len() - 1, "--name".to_string());
-        args.insert(args.len() - 1, vm_name.clone());
-    }
-
     let child = Command::new(exe)
-        .args(&args)
+        .args(detached_child_args(opts, &vm_name))
         .stdin(Stdio::null())
         .stdout(log_file.try_clone()?)
         .stderr(log_file)
@@ -393,11 +381,103 @@ fn run_detached(opts: &RunEphemeralOpts) -> Result<()> {
     Ok(())
 }
 
+/// The command line of the bcvk process running a detached VM: the same
+/// options, in the foreground, with an SSH key and the chosen name.
+///
+/// Built from the parsed options rather than by editing bcvk's own
+/// arguments, which may come in any order or in combined (`-dK`) and
+/// `--opt=value` forms.
+fn detached_child_args(opts: &RunEphemeralOpts, vm_name: &str) -> Vec<String> {
+    // No `..`, here or in the flattened option structs: a new option has
+    // to be passed on, or deliberately not
+    let RunEphemeralOpts {
+        image,
+        size:
+            crate::common_opts::VmSizeOpts {
+                itype,
+                memory: crate::common_opts::MemoryOpts { memory },
+                vcpus,
+            },
+        ssh_keygen: _,
+        execute,
+        name: _,
+        kernel_args,
+        gui: _,
+        detach: _,
+        debug,
+    } = opts;
+    let mut args: Vec<String> = vec![
+        "ephemeral".into(),
+        "run".into(),
+        "--ssh-keygen".into(),
+        format!("--name={vm_name}"),
+        format!("--memory={memory}"),
+    ];
+    if let Some(itype) = itype {
+        args.push(format!("--itype={itype}"));
+    }
+    if let Some(vcpus) = vcpus {
+        args.push(format!("--vcpus={vcpus}"));
+    }
+    args.extend(execute.iter().map(|cmd| format!("--execute={cmd}")));
+    args.extend(kernel_args.iter().map(|karg| format!("--karg={karg}")));
+    if *debug {
+        args.push("--debug".into());
+    }
+    args.extend(["--".into(), image.clone()]);
+    args
+}
+
 // --- macOS-specific helpers (pub for vfkit/ module) ---
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser as _;
+
+    #[test]
+    fn test_detached_child_args() {
+        for argv in [
+            // -d before an option value, which inserting arguments in
+            // front of the last one split from its option
+            &["run", "quay.io/img:1", "-d", "--memory", "2G"][..],
+            &[
+                "run",
+                "-dK",
+                "--vcpus=3",
+                "--itype",
+                "u1.small",
+                "--execute",
+                "echo -d",
+                "--karg=-x",
+                "--karg",
+                "console=ttyS0",
+                "--debug",
+                "--name",
+                "mine",
+                "--",
+                "-image-",
+            ],
+        ] {
+            let opts = RunEphemeralOpts::try_parse_from(argv).unwrap();
+            assert!(opts.detach, "{argv:?}");
+            let args = detached_child_args(&opts, "vm-1");
+            assert_eq!(args[..2], ["ephemeral", "run"]);
+            let child = RunEphemeralOpts::try_parse_from(
+                std::iter::once("run").chain(args[2..].iter().map(|a| a.as_str())),
+            )
+            .unwrap();
+            assert!(!child.detach && child.ssh_keygen, "{args:?}");
+            assert_eq!(child.name.as_deref(), Some("vm-1"));
+            assert_eq!(child.image, opts.image);
+            assert_eq!(child.size.memory.memory, opts.size.memory.memory);
+            assert_eq!(child.size.itype, opts.size.itype);
+            assert_eq!(child.size.vcpus, opts.size.vcpus);
+            assert_eq!(child.execute, opts.execute);
+            assert_eq!(child.kernel_args, opts.kernel_args);
+            assert_eq!(child.debug, opts.debug);
+        }
+    }
 
     #[test]
     fn test_ephemeral_vm_metadata_roundtrip() {
