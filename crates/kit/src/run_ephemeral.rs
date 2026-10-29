@@ -1752,23 +1752,10 @@ StandardOutput=file:/dev/virtio-ports/executestatus
     // virtiofs mount is handled solely by the sysroot.mount unit bcvk
     // injects into every initramfs via the CPIO append, together with the
     // initrd-root-fs.target.d/bcvk-sysroot.conf drop-in that wires it in.
-    let mut kernel_cmdline = [
-        // This avoids having journald interact with the rootfs
-        // at all, which lessens the I/O traffic for virtiofs
-        "systemd.mask=systemd-journal-flush.service",
-        // bootupd's automatic bootloader update needs a block device
-        // backing /boot or /sysroot, but here the root is virtiofs, so the
-        // unit fails and the system boots "degraded". Updating the
-        // bootloader makes no sense in an ephemeral VM anyway, and images
-        // will ship a bootupd without https://github.com/coreos/bootupd/pull/1072
-        // (which skips this case) for a long time.
-        "systemd.mask=bootloader-update.service",
-        // See https://github.com/bootc-dev/bcvk/issues/22
-        "selinux=0",
-    ]
-    .into_iter()
-    .map(ToOwned::to_owned)
-    .collect::<Vec<_>>();
+    let mut kernel_cmdline = crate::kernel_cmdline::EPHEMERAL_KERNEL_ARGS
+        .iter()
+        .map(|&arg| arg.to_owned())
+        .collect::<Vec<_>>();
 
     if opts.common.console {
         kernel_cmdline.push("console=hvc0".to_string());

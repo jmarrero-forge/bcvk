@@ -191,8 +191,13 @@ fn run_vfkit(opts: RunEphemeralOpts) -> Result<()> {
         ssh_pubkey = crate::vm_helpers::generate_ssh_keypair(&ssh_key_path)?;
     }
 
-    let mut cmdline_parts: Vec<&str> = Vec::from(crate::kernel_cmdline::BASE_KERNEL_CMDLINE);
+    let mut cmdline_parts: Vec<&str> = Vec::from(crate::kernel_cmdline::EPHEMERAL_KERNEL_ARGS);
     cmdline_parts.extend([
+        // The QEMU backend adds this only for images with cloud-init
+        // enabled, which it checks in the mounted image; it does nothing
+        // on images without it. See there for why cloud-init must be off.
+        "cloud-init=disabled",
+        "console=hvc0",
         "root=/dev/vda2",
         "ro",
         "rootfstype=erofs",
