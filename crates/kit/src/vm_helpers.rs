@@ -269,21 +269,27 @@ pub fn get_merged_path(machine: &str, rootful: bool, image: &str) -> Result<Stri
 }
 
 /// Deploy the NBD server binary to the podman machine (idempotent, hash-checked).
+///
+/// A new binary is written next to the old one and renamed over it, since
+/// the old one may still be running for another VM, and Linux refuses to
+/// write to a running executable (ETXTBSY).
 pub fn deploy_nbd_server(machine: &str, binary: &[u8]) -> Result<()> {
     use base64::Engine;
     let hash = binary_hash(binary);
     let b64 = base64::engine::general_purpose::STANDARD.encode(binary);
     let script = format!(
         "set -e; \
-         mkdir -p /var/tmp/bcvk; \
-         H=/var/tmp/bcvk/bcvk-nbd.sha256; \
+         D=/var/tmp/bcvk; \
+         mkdir -p \"$D\"; \
+         H=\"$D/bcvk-nbd.sha256\"; \
          if [ -f \"$H\" ] && [ \"$(cat \"$H\")\" = '{hash}' ]; then exit 0; fi; \
-         printf '%s' '{b64}' | base64 -d > /var/tmp/bcvk/bcvk-nbd; \
-         chmod +x /var/tmp/bcvk/bcvk-nbd; \
-         chcon -t bin_t /var/tmp/bcvk/bcvk-nbd 2>/dev/null || true; \
+         T=$(mktemp \"$D/bcvk-nbd.XXXXXX\"); \
+         trap 'rm -f \"$T\"' EXIT; \
+         printf '%s' '{b64}' | base64 -d > \"$T\"; \
+         chmod 755 \"$T\"; \
+         chcon -t bin_t \"$T\" 2>/dev/null || true; \
+         mv -f \"$T\" \"$D/bcvk-nbd\"; \
          printf '{hash}' > \"$H\"",
-        hash = hash,
-        b64 = b64,
     );
     info!("deploying nbd server to podman machine...");
     let mut child = Command::new("podman")
