@@ -212,16 +212,13 @@ pub fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// Compute a fast hash of binary data for deployment change detection.
+/// SHA-256 of binary data, hex encoded, for deployment change detection.
+///
+/// This is compared with the hash recorded on the podman machine, so it
+/// must not change between bcvk builds for the same data.
 pub fn binary_hash(data: &[u8]) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    data.hash(&mut h);
-    let hash1 = h.finish();
-    data.len().hash(&mut h);
-    let hash2 = h.finish();
-    format!("{:016x}{:016x}", hash1, hash2)
+    use sha2::{Digest, Sha256};
+    data_encoding::HEXLOWER.encode(&Sha256::digest(data))
 }
 
 /// Run a command inside the podman machine via SSH (best-effort, no output).
@@ -897,6 +894,14 @@ mod tests {
         ] {
             assert_eq!(http_status(response), expected, "{response:?}");
         }
+    }
+
+    #[test]
+    fn test_binary_hash() {
+        assert_eq!(
+            binary_hash(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 
     #[test]
