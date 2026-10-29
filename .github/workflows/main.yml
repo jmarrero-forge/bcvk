@@ -55,7 +55,7 @@ jobs:
         run: cargo check --all-targets
 
       - name: Run unit tests
-        run: cargo test --lib
+        run: cargo test
 
   build:
     needs: changes
