@@ -741,6 +741,16 @@ impl VfkitConfig<'_> {
     }
 }
 
+/// How long to wait for gvproxy to answer an API request.
+const GVPROXY_API_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The status code of an HTTP/1.x response, from its status line.
+fn http_status(response: &str) -> Option<u16> {
+    let mut fields = response.lines().next()?.split_whitespace();
+    fields.next().filter(|v| v.starts_with("HTTP/"))?;
+    fields.next()?.parse().ok()
+}
+
 /// Expose a TCP port forwarding rule via gvproxy's HTTP API.
 pub fn expose_port(
     services_sock: &str,
@@ -748,27 +758,34 @@ pub fn expose_port(
     host_port: u16,
     guest_port: u16,
 ) -> Result<()> {
+    use std::io::{Read as _, Write as _};
     use std::os::unix::net::UnixStream;
-    let body =
-        format!(r#"{{"local":":{host_port}","remote":"{vm_ip}:{guest_port}","protocol":"tcp"}}"#,);
-    let mut stream = UnixStream::connect(services_sock)?;
+
+    let body = serde_json::json!({
+        "local": format!(":{host_port}"),
+        "remote": format!("{vm_ip}:{guest_port}"),
+        "protocol": "tcp",
+    })
+    .to_string();
+    let mut stream = UnixStream::connect(services_sock)
+        .with_context(|| format!("connecting to gvproxy at {services_sock}"))?;
+    stream.set_read_timeout(Some(GVPROXY_API_TIMEOUT))?;
     let request = format!(
         "POST /services/forwarder/expose HTTP/1.1\r\nHost: unix\r\n\
-         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+         Content-Type: application/json\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{}",
         body.len(),
         body
     );
-    std::io::Write::write_all(&mut stream, request.as_bytes())?;
-    std::io::Write::flush(&mut stream)?;
-    let mut response = vec![0u8; 1024];
-    if let Err(e) = std::io::Read::read(&mut stream, &mut response) {
-        tracing::debug!("failed to read gvproxy response: {}", e);
-    }
-    let response_str = String::from_utf8_lossy(&response);
-    if !response_str.contains("200") {
+    stream.write_all(request.as_bytes())?;
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .context("reading gvproxy response")?;
+    if http_status(&response) != Some(200) {
         bail!(
-            "gvproxy expose failed: {}",
-            response_str.trim_end_matches('\0')
+            "gvproxy expose of port {host_port} failed: {}",
+            response.trim()
         );
     }
     Ok(())
@@ -863,6 +880,23 @@ mod tests {
         assert!(!process_alive(pid));
         // has_exited() reaped it already
         assert!(child.wait().is_err());
+    }
+
+    #[test]
+    fn test_http_status() {
+        for (response, expected) in [
+            ("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", Some(200)),
+            (
+                "HTTP/1.1 500 Internal Server Error\r\n\r\nproxy already running",
+                Some(500),
+            ),
+            ("HTTP/1.0 404 Not Found\r\n", Some(404)),
+            ("", None),
+            ("200 OK", None),
+            ("HTTP/1.1 abc", None),
+        ] {
+            assert_eq!(http_status(response), expected, "{response:?}");
+        }
     }
 
     #[test]
