@@ -148,13 +148,16 @@ fn generate_bootc_install_script(
 
 const CACHE_HASH_XATTR: &str = "user.bcvk.cache_hash";
 
+/// The cache key of a base disk: everything that goes into what is
+/// installed on it. (`--label` only labels the installing container.)
 fn compute_cache_hash(
     image_digest: &str,
     source_image: &str,
     install_opts: &InstallOptions,
+    disk_size_bytes: u64,
 ) -> String {
     let bootc_args = install_opts.to_bootc_args().join(",");
-    let input = format!("{}|{}|{}", image_digest, source_image, bootc_args);
+    let input = format!("{image_digest}|{source_image}|{bootc_args}|{disk_size_bytes}");
     let hash = Sha256::digest(input.as_bytes());
     format!("sha256:{}", data_encoding::HEXLOWER.encode(&hash))
 }
@@ -194,7 +197,8 @@ pub fn find_or_create_base_disk(
     install_log: &Option<String>,
     labels: &[String],
 ) -> Result<PathBuf> {
-    let cache_hash = compute_cache_hash(image_digest, source_image, install_options);
+    let size_bytes = crate::utils::parse_size(disk_size)?;
+    let cache_hash = compute_cache_hash(image_digest, source_image, install_options, size_bytes);
     let short_hash = cache_hash
         .strip_prefix("sha256:")
         .unwrap_or(&cache_hash)
@@ -224,7 +228,6 @@ pub fn find_or_create_base_disk(
     info!("creating base disk: {:?}", base_disk_path);
     let base_disk_str = base_disk_path.to_string_lossy().to_string();
 
-    let size_bytes = crate::utils::parse_size(disk_size)?;
     create_raw_disk(&base_disk_str, size_bytes)?;
 
     let key_path = PathBuf::from(format!("{}.key", base_disk_path.display()));
@@ -296,7 +299,12 @@ pub fn run(opts: ToDiskMacosOpts) -> Result<()> {
     let digest = ensure_image_and_get_digest(&opts.source_image)?;
     info!("image digest: {}...", &digest[..16.min(digest.len())]);
 
-    let cache_hash = compute_cache_hash(&digest, &opts.source_image, &opts.install);
+    let cache_hash = compute_cache_hash(
+        &digest,
+        &opts.source_image,
+        &opts.install,
+        crate::utils::parse_size(&opts.disk_size)?,
+    );
     let short_hash: String = cache_hash
         .strip_prefix("sha256:")
         .unwrap_or(&cache_hash)
@@ -374,6 +382,25 @@ mod tests {
             resolve_path_in_machine("/tmp/test.raw"),
             "/private/tmp/test.raw"
         );
+    }
+
+    #[test]
+    fn test_cache_hash_inputs() {
+        let opts = InstallOptions::default();
+        let xfs = InstallOptions {
+            filesystem: Some("xfs".into()),
+            ..Default::default()
+        };
+        let base = compute_cache_hash("d1", "img", &opts, 10 << 30);
+        assert_eq!(base, compute_cache_hash("d1", "img", &opts, 10 << 30));
+        for other in [
+            compute_cache_hash("d2", "img", &opts, 10 << 30),
+            compute_cache_hash("d1", "img2", &opts, 10 << 30),
+            compute_cache_hash("d1", "img", &xfs, 10 << 30),
+            compute_cache_hash("d1", "img", &opts, 50 << 30),
+        ] {
+            assert_ne!(base, other);
+        }
     }
 
     #[test]
