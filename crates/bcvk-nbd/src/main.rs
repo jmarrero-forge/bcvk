@@ -156,7 +156,13 @@ fn build_disk(args: &Args) -> (Vec<Region>, u64) {
     };
 
     let erofs_regions =
-        regions::consolidate_regions(erofs::build_erofs_regions(&erofs_layout, &walk));
+        match regions::consolidate_regions(erofs::build_erofs_regions(&erofs_layout, &walk)) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("failed to read small files: {e}");
+                std::process::exit(1);
+            }
+        };
 
     let (kernel_path, initrd_path) = match find_kernel_dir(&args.dir) {
         Some(paths) => paths,

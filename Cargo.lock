@@ -253,6 +253,7 @@ dependencies = [
  "data-encoding",
  "libc",
  "rustix",
+ "tempfile",
 ]
 
 [[package]]
