@@ -14,3 +14,4 @@ crc32fast = "1.4"
 cap-std = "4"
 rustix = { version = "1", features = ["fs"] }
 libc = "0.2"
+data-encoding = "2.9"
