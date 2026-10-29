@@ -156,7 +156,7 @@ pub(crate) fn launch(meta: &VmMetadata) -> Result<(Child, Child)> {
         stop_vm_processes, wait_for_ssh, FORWARD_ALL_INTERFACES, GVPROXY_VM_IP,
     };
 
-    let (gvproxy_sock, services_sock) = gvproxy_socket_paths(&VmMetadata::vms_dir(), &meta.name);
+    let (gvproxy_sock, services_sock) = gvproxy_socket_paths(&VmMetadata::vms_dir(), &meta.name)?;
     let services_sock = services_sock.to_string_lossy().to_string();
 
     info!("starting gvproxy...");

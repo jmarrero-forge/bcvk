@@ -10,7 +10,8 @@ use tracing::info;
 use super::{VmMetadata, VmMetadataStore};
 use crate::vm_helpers::{
     clear_xattr, detect_machine_name, ensure_image_and_get_digest, find_available_ssh_port,
-    remove_file_if_exists, run_ssh_interactive, sanitize_vm_name,
+    gvproxy_socket_paths, remove_file_if_exists, run_ssh_interactive, sanitize_vm_name,
+    validate_vm_name,
 };
 
 /// Port mapping from host to VM (format: host_port:guest_port).
@@ -135,6 +136,8 @@ pub fn run(opts: VmRunOpts) -> Result<()> {
         if vm_name.is_empty() {
             bail!("could not derive VM name from image. Use --name to specify one.");
         }
+        validate_vm_name(&vm_name)?;
+        gvproxy_socket_paths(&VmMetadata::vms_dir(), &vm_name)?;
 
         // Check existing VM
         if let Ok(existing) = VmMetadata::load(&vm_name) {
@@ -201,12 +204,18 @@ pub fn run(opts: VmRunOpts) -> Result<()> {
     let ssh_key_path = find_ssh_key(&opts.ssh_key, &disk_path_str)?;
 
     let vm_name = opts.name.clone().unwrap_or_else(|| {
-        Path::new(&disk_path_str)
+        let stem = Path::new(&disk_path_str)
             .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("vm")
-            .to_string()
+            .map(|s| sanitize_vm_name(&s.to_string_lossy()))
+            .unwrap_or_default();
+        if stem.is_empty() {
+            "vm".to_string()
+        } else {
+            stem
+        }
     });
+    validate_vm_name(&vm_name)?;
+    gvproxy_socket_paths(&VmMetadata::vms_dir(), &vm_name)?;
 
     let vms_dir = VmMetadata::vms_dir();
     fs::create_dir_all(&vms_dir)?;

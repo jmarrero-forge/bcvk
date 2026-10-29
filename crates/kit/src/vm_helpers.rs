@@ -197,18 +197,46 @@ pub fn generate_ssh_keypair(key_path: &Path) -> Result<String> {
     Ok(pubkey)
 }
 
-/// Sanitize a container image name into a valid VM name.
+/// Longest VM name accepted.
+const VM_NAME_MAX_LEN: usize = 64;
+
+/// Whether `c` may appear in a VM name (after its first character).
+fn is_vm_name_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '-' || c == '_'
+}
+
+/// Check that a VM name is safe to use as a file name, in a systemd unit
+/// name and in a shell command line: ASCII letters, digits, `-` and `_`,
+/// starting with a letter or digit. So it can't name a path outside of
+/// bcvk's directories either.
+pub fn validate_vm_name(name: &str) -> Result<()> {
+    let valid = name.len() <= VM_NAME_MAX_LEN
+        && name.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && name.chars().all(is_vm_name_char);
+    if !valid {
+        bail!(
+            "invalid VM name '{name}': use up to {VM_NAME_MAX_LEN} ASCII letters, digits, \
+             '-' and '_', starting with a letter or digit"
+        );
+    }
+    Ok(())
+}
+
+/// Sanitize a container image name into a valid VM name (possibly empty).
 pub fn sanitize_vm_name(image: &str) -> String {
-    image
+    let name: String = image
         .split('/')
         .last()
         .unwrap_or(image)
-        .replace(':', "-")
-        .replace('.', "-")
+        .replace([':', '.', '@'], "-")
         .chars()
-        .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+        .filter(|&c| is_vm_name_char(c))
+        .collect();
+    name.trim_start_matches(|c: char| !c.is_ascii_alphanumeric())
+        .chars()
+        .take(VM_NAME_MAX_LEN)
         .collect::<String>()
-        .trim_matches('-')
+        .trim_end_matches('-')
         .to_string()
 }
 
@@ -332,13 +360,7 @@ pub fn start_nbd_unit(
     ssh_pubkey: &str,
     listen_arg: &str,
 ) -> Result<()> {
-    if let Err(e) = machine_ssh(
-        machine,
-        &format!(
-            "systemctl stop {u} 2>/dev/null; systemctl reset-failed {u} 2>/dev/null",
-            u = unit_name
-        ),
-    ) {
+    if let Err(e) = machine_ssh(machine, &stop_unit_cmd(unit_name)) {
         tracing::debug!("pre-cleanup of unit {} failed: {}", unit_name, e);
     }
 
@@ -353,9 +375,9 @@ pub fn start_nbd_unit(
          --property=LimitNOFILE=524288 \
          /var/tmp/bcvk/bcvk-nbd {listen} --dir {merged} \
          --cmdline {cmdline}{ssh}",
-        unit = unit_name,
+        unit = shell_escape(unit_name),
         listen = listen_arg,
-        merged = merged_path,
+        merged = shell_escape(merged_path),
         cmdline = cmdline_esc,
         ssh = ssh_args,
     );
@@ -367,22 +389,25 @@ pub fn start_nbd_unit(
     Ok(())
 }
 
+/// Command stopping a unit and forgetting that it failed, if it did.
+fn stop_unit_cmd(unit_name: &str) -> String {
+    format!(
+        "systemctl stop {u} 2>/dev/null; systemctl reset-failed {u} 2>/dev/null",
+        u = shell_escape(unit_name)
+    )
+}
+
 /// Stop an NBD server systemd-run unit (best-effort).
 pub fn stop_nbd_unit(machine: &str, unit_name: &str) {
-    if let Err(e) = machine_ssh(
-        machine,
-        &format!(
-            "systemctl stop {u} 2>/dev/null; systemctl reset-failed {u} 2>/dev/null",
-            u = unit_name
-        ),
-    ) {
+    if let Err(e) = machine_ssh(machine, &stop_unit_cmd(unit_name)) {
         tracing::debug!("stop_nbd_unit failed for {}: {}", unit_name, e);
     }
 }
 
 /// Check if a systemd-run unit has died.
 pub fn is_nbd_unit_dead(machine: &str, unit_name: &str) -> bool {
-    if let Ok(out) = machine_ssh_output(machine, &format!("systemctl is-active {}", unit_name)) {
+    let cmd = format!("systemctl is-active {}", shell_escape(unit_name));
+    if let Ok(out) = machine_ssh_output(machine, &cmd) {
         let stdout = String::from_utf8_lossy(&out.stdout);
         let state = stdout.trim();
         state == "inactive" || state == "failed"
@@ -431,26 +456,36 @@ pub trait VmMetadataStore: serde::Serialize + serde::de::DeserializeOwned + Size
     /// Return the VM name used as the JSON filename stem.
     fn name(&self) -> &str;
 
+    /// The metadata file of the named VM, once the name is checked with
+    /// [`validate_vm_name`].
+    fn metadata_path(name: &str) -> color_eyre::Result<PathBuf> {
+        validate_vm_name(name)?;
+        Ok(Self::vms_dir().join(format!("{name}.json")))
+    }
+
     /// Save metadata to a JSON file in the VMs directory.
     fn save(&self) -> color_eyre::Result<()> {
-        let dir = Self::vms_dir();
-        std::fs::create_dir_all(&dir)?;
-        let path = dir.join(format!("{}.json", self.name()));
-        std::fs::write(&path, serde_json::to_string_pretty(self)?)?;
+        let path = Self::metadata_path(self.name())?;
+        std::fs::create_dir_all(Self::vms_dir())?;
+        std::fs::write(&path, serde_json::to_string_pretty(self)?)
+            .with_context(|| format!("writing {}", path.display()))?;
         Ok(())
     }
 
     /// Load metadata for the named VM from its JSON file.
     fn load(name: &str) -> color_eyre::Result<Self> {
-        let path = Self::vms_dir().join(format!("{}.json", name));
-        let data = std::fs::read_to_string(&path)?;
-        Ok(serde_json::from_str(&data)?)
+        let path = Self::metadata_path(name)?;
+        let data = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading metadata of VM '{name}'"))?;
+        serde_json::from_str(&data).with_context(|| format!("parsing {}", path.display()))
     }
 
     /// Remove metadata file for the named VM.
     fn remove(name: &str) {
-        let path = Self::vms_dir().join(format!("{}.json", name));
-        remove_file_if_exists(&path);
+        // An invalid name has no metadata file to remove
+        if let Ok(path) = Self::metadata_path(name) {
+            remove_file_if_exists(&path);
+        }
     }
 
     /// List all VM metadata from the VMs directory.
@@ -610,12 +645,35 @@ pub fn setup_ssh_port_forwarding(services_sock: &str, ssh_port: u16) -> Result<(
     Ok(())
 }
 
-/// Construct gvproxy Unix socket paths for a given VM.
-pub fn gvproxy_socket_paths(base: &Path, vm_name: &str) -> (PathBuf, PathBuf) {
-    (
+/// Size of `sun_path` in macOS's `struct sockaddr_un` (`<sys/un.h>`),
+/// which holds a Unix socket's path and its terminating NUL.
+const SUN_PATH_SIZE: usize = 104;
+
+/// Check that `path` fits in a Unix socket address.
+fn check_socket_path(path: &Path) -> Result<()> {
+    let len = path.as_os_str().len();
+    if len >= SUN_PATH_SIZE {
+        bail!(
+            "socket path {} is {len} bytes long, more than the {} macOS allows; \
+             use a shorter VM name",
+            path.display(),
+            SUN_PATH_SIZE - 1
+        );
+    }
+    Ok(())
+}
+
+/// The gvproxy Unix socket paths of a VM: vfkit's, then the services
+/// API's. Fails if they are too long for a socket address, which a long
+/// VM name in a long home directory can make them.
+pub fn gvproxy_socket_paths(base: &Path, vm_name: &str) -> Result<(PathBuf, PathBuf)> {
+    let paths = (
         base.join(format!("{vm_name}-gvproxy.sock")),
         base.join(format!("{vm_name}-gvproxy-svc.sock")),
-    )
+    );
+    check_socket_path(&paths.0)?;
+    check_socket_path(&paths.1)?;
+    Ok(paths)
 }
 
 /// Format a 6-byte MAC address as a colon-separated hex string.
@@ -847,12 +905,81 @@ mod tests {
 
     #[test]
     fn test_sanitize_vm_name() {
+        let long = "a".repeat(VM_NAME_MAX_LEN + 10);
+        for (image, expected) in [
+            ("quay.io/fedora/fedora-bootc:latest", "fedora-bootc-latest"),
+            ("centos:stream10", "centos-stream10"),
+            ("simple", "simple"),
+            ("localhost/_test:1.0", "test-1-0"),
+            ("quay.io/x/img@sha256:abc", "img-sha256-abc"),
+            ("registry/caf\u{e9}:v1", "caf-v1"),
+            ("", ""),
+            (long.as_str(), &long[..VM_NAME_MAX_LEN]),
+        ] {
+            let name = sanitize_vm_name(image);
+            assert_eq!(name, expected, "{image}");
+            if !name.is_empty() {
+                validate_vm_name(&name).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn test_validate_vm_name() {
+        let longest = "a".repeat(VM_NAME_MAX_LEN);
+        for name in ["vm", "my-vm_2", "ephemeral-0123abcd", "9", longest.as_str()] {
+            validate_vm_name(name).unwrap();
+        }
+        let too_long = "a".repeat(VM_NAME_MAX_LEN + 1);
+        for name in [
+            "",
+            "..",
+            "../x",
+            "/tmp/important",
+            "a/b",
+            ".hidden",
+            "-rf",
+            "_x",
+            "a.b",
+            "a b",
+            "x;reboot",
+            "$(id)",
+            "a'b",
+            "caf\u{e9}",
+            too_long.as_str(),
+        ] {
+            assert!(validate_vm_name(name).is_err(), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn test_gvproxy_socket_paths() {
+        let base = Path::new("/Users/alice/.local/share/bcvk/vms");
+        let (sock, svc) = gvproxy_socket_paths(base, "vm").unwrap();
+        assert_eq!(sock, base.join("vm-gvproxy.sock"));
+        assert_eq!(svc, base.join("vm-gvproxy-svc.sock"));
+        // The longest name that fits
+        let fits = SUN_PATH_SIZE - 1 - format!("{}/-gvproxy-svc.sock", base.display()).len();
+        gvproxy_socket_paths(base, &"a".repeat(fits)).unwrap();
+        let err = gvproxy_socket_paths(base, &"a".repeat(fits + 1)).unwrap_err();
+        assert!(err.to_string().contains("shorter VM name"), "{err}");
+    }
+
+    #[test]
+    fn test_shell_escape() {
+        for (input, expected) in [
+            ("plain", "'plain'"),
+            ("", "''"),
+            ("a b", "'a b'"),
+            ("it's", "'it'\\''s'"),
+            ("$(id) `id` ;|&", "'$(id) `id` ;|&'"),
+        ] {
+            assert_eq!(shell_escape(input), expected, "{input}");
+        }
         assert_eq!(
-            sanitize_vm_name("quay.io/fedora/fedora-bootc:latest"),
-            "fedora-bootc-latest"
+            stop_unit_cmd("bcvk-nbd-vm"),
+            "systemctl stop 'bcvk-nbd-vm' 2>/dev/null; systemctl reset-failed 'bcvk-nbd-vm' 2>/dev/null"
         );
-        assert_eq!(sanitize_vm_name("centos:stream10"), "centos-stream10");
-        assert_eq!(sanitize_vm_name("simple"), "simple");
     }
 
     #[test]

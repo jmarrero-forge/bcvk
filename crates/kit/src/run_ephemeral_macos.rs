@@ -154,6 +154,10 @@ pub fn run(opts: RunEphemeralOpts) -> Result<()> {
     if opts.gui && opts.detach {
         bail!("--gui and --detach cannot be used together (GUI requires foreground process)");
     }
+    if let Some(name) = &opts.name {
+        crate::vm_helpers::validate_vm_name(name)?;
+        crate::vm_helpers::gvproxy_socket_paths(&ephemeral_base_dir(), name)?;
+    }
     run_vfkit(opts)
 }
 
@@ -244,7 +248,7 @@ fn run_vfkit(opts: RunEphemeralOpts) -> Result<()> {
 
     // gvproxy + vfkit (EFI boot)
     let (gvproxy_sock, services_sock) =
-        crate::vm_helpers::gvproxy_socket_paths(&cache_base, &vm_name);
+        crate::vm_helpers::gvproxy_socket_paths(&cache_base, &vm_name)?;
     let services_sock_str = services_sock.to_string_lossy().to_string();
     info!("starting gvproxy...");
     let gvproxy_child = start_gvproxy(&gvproxy_sock.to_string_lossy(), &services_sock_str)?;
