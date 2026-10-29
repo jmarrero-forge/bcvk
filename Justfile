@@ -17,8 +17,16 @@ unit *ARGS:
     set -euo pipefail
     if command -v cargo-nextest &> /dev/null; then
         cargo nextest run {{ ARGS }}
+        nbd=(cargo nextest run --no-tests=pass -p bcvk-nbd)
     else
         cargo test {{ ARGS }}
+        nbd=(cargo test -p bcvk-nbd)
+    fi
+    # bcvk-nbd only builds for Linux, so it isn't a default workspace member.
+    # ARGS (a filter, -p, --lib...) are meant for the run above, so run
+    # bcvk-nbd's tests only in a plain `just unit`.
+    if test "$(uname -s)" = Linux && test -z "{{ ARGS }}"; then
+        "${nbd[@]}"
     fi
 
 pull-test-images:

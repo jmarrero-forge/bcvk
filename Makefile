@@ -42,6 +42,7 @@ validate:
 	cargo fmt -- --check -l
 	cargo test --no-run --workspace
 	cargo clippy -- $(CLIPPY_CONFIG)
+	cargo clippy -p bcvk-nbd -- $(CLIPPY_CONFIG)
 	env RUSTDOCFLAGS='-D warnings' cargo doc --lib
 .PHONY: validate
 
