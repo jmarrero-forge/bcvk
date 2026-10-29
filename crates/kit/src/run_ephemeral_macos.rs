@@ -236,7 +236,13 @@ fn run_vfkit(opts: RunEphemeralOpts) -> Result<()> {
 
     let nbd_port = crate::nbd_macos::find_available_nbd_port();
     info!("NBD transport: TCP (port {})", nbd_port);
-    let nbd_unit_name = crate::nbd_macos::start_nbd_server(
+    let nbd_unit_name = crate::nbd_macos::nbd_unit_name(&vm_name);
+    // Before starting it, as a failed start can leave the unit running (a
+    // server still scanning the image when the wait for it times out, say)
+    // and the port forwarded
+    cleanup.nbd_unit = Some(nbd_unit_name.clone());
+    cleanup.nbd_port = Some(nbd_port);
+    crate::nbd_macos::start_nbd_server(
         &machine,
         &merged_path,
         &cmdline,
@@ -244,8 +250,6 @@ fn run_vfkit(opts: RunEphemeralOpts) -> Result<()> {
         nbd_port,
         &vm_name,
     )?;
-    cleanup.nbd_unit = Some(nbd_unit_name.clone());
-    cleanup.nbd_port = Some(nbd_port);
 
     let vcpus = opts.size.vcpus();
     let memory_mb = opts.size.memory_mb()?;

@@ -19,7 +19,15 @@ pub(crate) fn deploy_nbd_server(machine: &str) -> Result<()> {
     vm_helpers::deploy_nbd_server(machine, NBD_SERVER)
 }
 
+/// The systemd unit running the NBD server of a VM in the podman machine.
+pub(crate) fn nbd_unit_name(vm_name: &str) -> String {
+    format!("bcvk-nbd-{vm_name}")
+}
+
 /// Start the NBD server via systemd-run and expose the port via gvproxy.
+///
+/// On failure, the unit and the port forward may be left behind: undo
+/// them with [`stop_nbd_server`].
 pub(crate) fn start_nbd_server(
     machine: &str,
     merged_path: &str,
@@ -27,8 +35,8 @@ pub(crate) fn start_nbd_server(
     ssh_pubkey: &str,
     nbd_port: u16,
     vm_name: &str,
-) -> Result<String> {
-    let unit_name = format!("bcvk-nbd-{}", vm_name);
+) -> Result<()> {
+    let unit_name = nbd_unit_name(vm_name);
 
     vm_helpers::start_nbd_unit(
         machine,
@@ -100,7 +108,7 @@ pub(crate) fn start_nbd_server(
         Duration::from_millis(500),
     )?;
 
-    Ok(unit_name)
+    Ok(())
 }
 
 /// NBD port allocation range start (inclusive).
