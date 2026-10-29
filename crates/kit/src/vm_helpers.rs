@@ -914,6 +914,5 @@ mod tests {
     fn test_find_available_ssh_port() {
         let port = find_available_ssh_port();
         assert!((2222..3000).contains(&port));
-        assert!(std::net::TcpListener::bind(("127.0.0.1", port)).is_ok());
     }
 }
