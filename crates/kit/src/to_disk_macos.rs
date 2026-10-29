@@ -132,10 +132,14 @@ fn generate_bootc_install_script(
         format!("  {} \\\n", label_args)
     };
 
+    let disk_path_quoted = shlex::try_quote(disk_path_in_machine)
+        .unwrap_or(std::borrow::Cow::Borrowed(disk_path_in_machine))
+        .to_string();
+
     include_str!("../scripts/bootc-install-to-disk.sh")
         .replace("@@RUST_LOG@@", &rust_log_line)
         .replace("@@SUDO@@", sudo)
-        .replace("@@DISK_PATH@@", disk_path_in_machine)
+        .replace("@@DISK_PATH@@", &disk_path_quoted)
         .replace("@@SSH_PUBKEY_B64@@", &pub_key_b64)
         .replace("@@LABEL_LINE@@", &label_line)
         .replace("@@IMAGE@@", &image_quoted)
@@ -361,7 +365,6 @@ pub fn run(opts: ToDiskMacosOpts) -> Result<()> {
 }
 
 #[cfg(test)]
-#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -371,5 +374,31 @@ mod tests {
             resolve_path_in_machine("/tmp/test.raw"),
             "/private/tmp/test.raw"
         );
+    }
+
+    #[test]
+    fn test_install_script_quotes_disk_path() {
+        for disk in [
+            "/Users/jdoe/disk.raw",
+            "/Users/John Smith/disk.raw",
+            "/Users/x/$(reboot)/`id`;'q'.raw",
+        ] {
+            let script = generate_bootc_install_script(
+                disk,
+                "quay.io/fedora/fedora-bootc:44",
+                &InstallOptions::default(),
+                "ssh-ed25519 AAAA",
+                true,
+                &None,
+                &[],
+            );
+            let losetup = script.lines().find(|l| l.contains("losetup -fP")).unwrap();
+            let words = losetup
+                .strip_prefix("LOOP=$(")
+                .and_then(|l| l.strip_suffix(')'))
+                .and_then(shlex::split)
+                .unwrap();
+            assert_eq!(words, ["losetup", "-fP", "--show", disk], "{losetup}");
+        }
     }
 }
