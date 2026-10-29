@@ -43,22 +43,8 @@ pub fn run(opts: VmRmOpts) -> Result<()> {
         meta.stop_processes(true);
     }
 
-    // Remove disk image and SSH keys if they are inside the bcvk vms directory
-    // (i.e., created by `bcvk run`). User-provided disks from `bcvk vm run` are left alone.
+    remove_own_disk(&meta);
     let vms_dir = VmMetadata::vms_dir();
-    if std::path::Path::new(&meta.disk_image).starts_with(&vms_dir) {
-        for path in [
-            meta.disk_image.clone(),
-            format!("{}.key", meta.disk_image),
-            format!("{}.key.pub", meta.disk_image),
-        ] {
-            if let Err(e) = fs::remove_file(&path) {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    tracing::debug!("failed to remove {}: {}", path, e);
-                }
-            }
-        }
-    }
 
     for path in [&meta.efi_store, &meta.serial_log] {
         if !path.is_empty() {
@@ -82,4 +68,23 @@ pub fn run(opts: VmRmOpts) -> Result<()> {
     VmMetadata::remove(&opts.name);
     println!("Removed '{}'", opts.name);
     Ok(())
+}
+
+/// Remove the disk image and SSH keys of a VM if bcvk made them (see
+/// [`VmMetadata::has_own_disk`]); a disk of the user's own is left alone.
+pub(crate) fn remove_own_disk(meta: &VmMetadata) {
+    if !meta.has_own_disk() {
+        return;
+    }
+    for path in [
+        meta.disk_image.clone(),
+        format!("{}.key", meta.disk_image),
+        format!("{}.key.pub", meta.disk_image),
+    ] {
+        if let Err(e) = fs::remove_file(&path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::debug!("failed to remove {}: {}", path, e);
+            }
+        }
+    }
 }

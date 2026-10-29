@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
-use color_eyre::{eyre::bail, Result};
+use color_eyre::{eyre::bail, eyre::Context as _, Result};
 use tracing::info;
 
 use super::{VmMetadata, VmMetadataStore};
@@ -123,106 +123,38 @@ pub fn run(opts: VmRunOpts) -> Result<()> {
     }
     validate_labels(&opts.label)?;
 
-    let (disk_path_str, image_name) = if is_disk_path(&opts.image_or_disk) {
-        let p = Path::new(&opts.image_or_disk);
-        if !p.exists() {
-            bail!("disk image not found: {}", opts.image_or_disk);
-        }
-        (opts.image_or_disk.clone(), None)
+    let disk_input = is_disk_path(&opts.image_or_disk);
+    let vm_name = choose_vm_name(&opts, disk_input)?;
+
+    let existing = VmMetadata::load_if_exists(&vm_name)?;
+    if existing.is_some() && !opts.replace {
+        bail!(
+            "VM '{}' already exists. Use --replace to overwrite, or --name to choose a different name.",
+            vm_name
+        );
+    }
+
+    // Check what can be checked before replacing a VM, so that a run that
+    // would fail doesn't remove it
+    let disk_path = if disk_input {
+        // Absolute, so that later commands find it from any directory
+        fs::canonicalize(&opts.image_or_disk)
+            .with_context(|| format!("disk image not found: {}", opts.image_or_disk))?
     } else {
-        let image = &opts.image_or_disk;
-        let vm_name = opts.name.clone().unwrap_or_else(|| sanitize_vm_name(image));
-
-        if vm_name.is_empty() {
-            bail!("could not derive VM name from image. Use --name to specify one.");
-        }
-        validate_vm_name(&vm_name)?;
-        gvproxy_socket_paths(&VmMetadata::vms_dir(), &vm_name)?;
-
-        // Check existing VM
-        if let Ok(existing) = VmMetadata::load(&vm_name) {
-            if opts.replace {
-                info!("replacing existing VM '{}'", vm_name);
-                // Its disk is about to be replaced, so there is nothing to shut down cleanly.
-                existing.stop_processes(true);
-                VmMetadata::remove(&vm_name);
-            } else {
-                bail!(
-                    "VM '{}' already exists. Use --replace to overwrite, or --name to choose a different name.",
-                    vm_name
-                );
-            }
-        }
-
-        let vms_dir = crate::to_disk_macos::vms_dir();
-        fs::create_dir_all(&vms_dir)?;
-        let disk_path = vms_dir.join(format!("{}.raw", vm_name));
-        let key_path = PathBuf::from(format!("{}.key", disk_path.display()));
-        let key_pub_path = PathBuf::from(format!("{}.pub", key_path.display()));
-
-        if opts.replace {
-            remove_file_if_exists(&disk_path);
-            remove_file_if_exists(&key_path);
-            remove_file_if_exists(&key_pub_path);
-        }
-
-        if !disk_path.exists() {
-            info!("creating disk image for VM '{}'...", vm_name);
-            let machine = detect_machine_name()?;
-            let digest = ensure_image_and_get_digest(image)?;
-
-            let base_disk_path = crate::to_disk_macos::find_or_create_base_disk(
-                image,
-                &digest,
-                &opts.install,
-                &opts.disk_size,
-                &machine,
-                &None,
-                &[],
-            )?;
-
-            crate::to_disk_macos::clone_base_disk(&base_disk_path, &disk_path)?;
-
-            let base_key = PathBuf::from(format!("{}.key", base_disk_path.display()));
-            if base_key.exists() {
-                fs::copy(&base_key, &key_path)?;
-                let base_pub = PathBuf::from(format!("{}.pub", base_key.display()));
-                if base_pub.exists() {
-                    fs::copy(&base_pub, &key_pub_path)?;
-                }
-            }
-        }
-
-        (
-            disk_path.to_string_lossy().to_string(),
-            Some(image.to_string()),
-        )
+        crate::to_disk_macos::vms_dir().join(format!("{}.raw", vm_name))
     };
-
-    clear_xattr(Path::new(&disk_path_str));
-
-    let ssh_key_path = find_ssh_key(&opts.ssh_key, &disk_path_str)?;
-
-    let vm_name = opts.name.clone().unwrap_or_else(|| {
-        let stem = Path::new(&disk_path_str)
-            .file_stem()
-            .map(|s| sanitize_vm_name(&s.to_string_lossy()))
-            .unwrap_or_default();
-        if stem.is_empty() {
-            "vm".to_string()
-        } else {
-            stem
-        }
-    });
-    validate_vm_name(&vm_name)?;
-    gvproxy_socket_paths(&VmMetadata::vms_dir(), &vm_name)?;
-
-    let vms_dir = VmMetadata::vms_dir();
-    fs::create_dir_all(&vms_dir)?;
-
-    let efi_store = vms_dir.join(format!("{}-efi-vars", vm_name));
-    let serial_log = vms_dir.join(format!("{}-serial.log", vm_name));
-
+    let disk_path_str = disk_path.to_string_lossy().to_string();
+    super::check_disk_not_in_use(&vm_name, &disk_path_str)?;
+    let explicit_ssh_key = opts
+        .ssh_key
+        .as_deref()
+        .map(|p| {
+            // Absolute, so that later commands find it from any directory
+            fs::canonicalize(p)
+                .map(|key| key.to_string_lossy().to_string())
+                .with_context(|| format!("SSH key not found: {p}"))
+        })
+        .transpose()?;
     let vcpus = opts.itype.map(|t| t.vcpus()).or(opts.vcpus).unwrap_or(2);
     let memory_mb = opts
         .itype
@@ -230,17 +162,50 @@ pub fn run(opts: VmRunOpts) -> Result<()> {
         .map(Ok)
         .unwrap_or_else(|| crate::utils::parse_memory_to_mb(&opts.memory.memory))?;
 
+    // A disk image's key can be looked for now; one made from a container
+    // image comes with its disk
+    let ssh_key = match explicit_ssh_key {
+        None if disk_input => Some(find_ssh_key(&disk_path_str)?),
+        key => key,
+    };
+    // The base disk too, installing the image into it being the step most
+    // likely to fail. A disk of bcvk's left without its VM is used as it
+    // is, unless --replace.
+    let base_disk = if disk_input || (!opts.replace && disk_path.exists()) {
+        None
+    } else {
+        let image = &opts.image_or_disk;
+        let machine = detect_machine_name()?;
+        let digest = ensure_image_and_get_digest(image)?;
+        Some(crate::to_disk_macos::find_or_create_base_disk(
+            image,
+            &digest,
+            &opts.install,
+            &opts.disk_size,
+            &machine,
+            &None,
+            &[],
+        )?)
+    };
+
+    let vms_dir = VmMetadata::vms_dir();
+    fs::create_dir_all(&vms_dir)?;
+
+    let efi_store = vms_dir.join(format!("{}-efi-vars", vm_name));
+    let serial_log = vms_dir.join(format!("{}-serial.log", vm_name));
+
     let ssh_port = opts.ssh_port.unwrap_or_else(find_available_ssh_port);
     info!("SSH port: {}", ssh_port);
 
     let mut metadata = VmMetadata {
         name: vm_name.clone(),
-        image: image_name,
+        image: (!disk_input).then(|| opts.image_or_disk.clone()),
         disk_image: disk_path_str.clone(),
         vfkit: TrackedProcess::NONE,
         gvproxy: TrackedProcess::NONE,
         ssh_port,
-        ssh_key: ssh_key_path.clone(),
+        // Known once the disk is there
+        ssh_key: String::new(),
         vcpus,
         memory_mb,
         efi_store: efi_store.to_string_lossy().to_string(),
@@ -255,11 +220,28 @@ pub fn run(opts: VmRunOpts) -> Result<()> {
             .map(|pm| (pm.host_port, pm.guest_port))
             .collect(),
     };
-    let (vfkit_child, gvproxy_child) = super::launch(&metadata)?;
-    metadata.vfkit = TrackedProcess::new(vfkit_child.id());
-    metadata.gvproxy = TrackedProcess::new(gvproxy_child.id());
-    metadata.save()?;
-    let key_path = Path::new(&ssh_key_path);
+    // Under the VMs lock, where what was checked above may have changed:
+    // another bcvk command may have created, replaced or removed the VM,
+    // or its disk, meanwhile
+    let prepare = |meta: &mut VmMetadata| -> Result<()> {
+        prepare_disk(
+            &vm_name,
+            existing.as_ref(),
+            disk_input,
+            &disk_path,
+            base_disk.as_deref(),
+            opts.replace,
+        )?;
+        clear_xattr(&disk_path);
+        meta.ssh_key = match &ssh_key {
+            Some(key) => key.clone(),
+            None => find_ssh_key(&disk_path_str)?,
+        };
+        Ok(())
+    };
+    super::launch(&mut metadata, super::Launch::New, prepare)?;
+    let ssh_key_path = &metadata.ssh_key;
+    let key_path = Path::new(ssh_key_path);
 
     println!("VM '{}' is running", vm_name);
     println!(
@@ -284,13 +266,134 @@ pub fn run(opts: VmRunOpts) -> Result<()> {
     Ok(())
 }
 
-fn find_ssh_key(explicit: &Option<String>, disk_path: &str) -> Result<String> {
-    if let Some(p) = explicit {
-        if !Path::new(p).exists() {
-            bail!("SSH key not found: {}", p);
-        }
-        return Ok(p.clone());
+/// Replace the VM that `vm run` found under the name, if any, and create
+/// the new VM's disk from `base_disk` unless `disk` is the user's own,
+/// see [`replace_existing`] and [`create_disk`]. Under the VMs lock.
+fn prepare_disk(
+    name: &str,
+    existing: Option<&VmMetadata>,
+    disk_input: bool,
+    disk: &Path,
+    base_disk: Option<&Path>,
+    replace: bool,
+) -> Result<()> {
+    replace_existing(name, existing, disk_input, &disk.to_string_lossy())?;
+    if let Some(base_disk) = base_disk {
+        create_disk(name, base_disk, disk, replace)?;
     }
+    Ok(())
+}
+
+/// Stop and remove the VM that `vm run --replace` replaces, `existing`
+/// as `vm run` found it before. Under the VMs lock.
+///
+/// Fails if the VM saved under the name isn't that one: another bcvk
+/// command created it meanwhile, and only the VM the user saw is replaced.
+/// Fails too if its disk would go while another running VM uses it.
+fn replace_existing(
+    name: &str,
+    existing: Option<&VmMetadata>,
+    disk_input: bool,
+    new_disk: &str,
+) -> Result<()> {
+    // None: there was none, or another command removed it meanwhile
+    let Some(current) = VmMetadata::load_if_exists(name)? else {
+        return Ok(());
+    };
+    if existing.is_none_or(|existing| existing.created != current.created) {
+        bail!("VM '{name}' was created by another bcvk command meanwhile");
+    }
+    let keep_disk = replacement_keeps_disk(&current, disk_input, new_disk);
+    if !keep_disk {
+        // Another VM may have been started off it while this one was
+        // stopped
+        super::check_disk_not_in_use(name, &current.disk_image)?;
+    }
+    info!("replacing existing VM '{}'", name);
+    // A disk that goes has nothing worth a clean shutdown
+    current.stop_processes(!keep_disk);
+    if !keep_disk {
+        super::rm::remove_own_disk(&current);
+    }
+    VmMetadata::remove(name);
+    Ok(())
+}
+
+/// Create the disk of VM `name` at `disk` from the base disk, with the
+/// base disk's SSH key. Under the VMs lock, once no VM of that name is
+/// left.
+///
+/// `vm run` found no disk there earlier, or was given --replace: a disk
+/// there now without --replace is another bcvk command's, so this fails
+/// rather than remove it. With --replace, the disk goes unless a running
+/// VM of another name uses it.
+fn create_disk(name: &str, base_disk: &Path, disk: &Path, replace: bool) -> Result<()> {
+    if disk.exists() {
+        if !replace {
+            bail!(
+                "disk image {} was created by another bcvk command meanwhile",
+                disk.display()
+            );
+        }
+        super::check_disk_not_in_use(name, &disk.to_string_lossy())?;
+    }
+    let key_path = PathBuf::from(format!("{}.key", disk.display()));
+    let key_pub_path = PathBuf::from(format!("{}.pub", key_path.display()));
+    remove_file_if_exists(disk);
+    remove_file_if_exists(&key_path);
+    remove_file_if_exists(&key_pub_path);
+    info!("creating disk image for VM '{}'...", name);
+    crate::to_disk_macos::clone_base_disk(base_disk, disk)?;
+
+    let base_key = PathBuf::from(format!("{}.key", base_disk.display()));
+    if base_key.exists() {
+        fs::copy(&base_key, &key_path)?;
+        let base_pub = PathBuf::from(format!("{}.pub", base_key.display()));
+        if base_pub.exists() {
+            fs::copy(&base_pub, &key_pub_path)?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether the disk of a VM that `vm run --replace` replaces stays: one
+/// bcvk made from an image goes with its VM, unless the new VM boots
+/// from it; one of the user's own stays.
+fn replacement_keeps_disk(existing: &VmMetadata, disk_input: bool, new_disk: &str) -> bool {
+    !existing.has_own_disk() || (disk_input && existing.disk_image == new_disk)
+}
+
+/// The VM's name: `--name`, or else derived from the image name or the
+/// disk's file name.
+fn choose_vm_name(opts: &VmRunOpts, disk_input: bool) -> Result<String> {
+    let name = match &opts.name {
+        Some(name) => name.clone(),
+        None if disk_input => {
+            let stem = Path::new(&opts.image_or_disk)
+                .file_stem()
+                .map(|s| sanitize_vm_name(&s.to_string_lossy()))
+                .unwrap_or_default();
+            if stem.is_empty() {
+                "vm".to_string()
+            } else {
+                stem
+            }
+        }
+        None => {
+            let name = sanitize_vm_name(&opts.image_or_disk);
+            if name.is_empty() {
+                bail!("could not derive VM name from image. Use --name to specify one.");
+            }
+            name
+        }
+    };
+    validate_vm_name(&name)?;
+    gvproxy_socket_paths(&VmMetadata::vms_dir(), &name)?;
+    Ok(name)
+}
+
+/// The SSH key of a VM without --ssh-key.
+fn find_ssh_key(disk_path: &str) -> Result<String> {
     let auto_key = format!("{}.key", disk_path);
     if Path::new(&auto_key).exists() {
         info!("using auto-generated SSH key: {}", auto_key);
@@ -307,4 +410,144 @@ fn find_ssh_key(explicit: &Option<String>, disk_path: &str) -> Result<String> {
     Err(color_eyre::eyre::eyre!(
         "no SSH key found. Specify with --ssh-key"
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_replace_existing() {
+        let _dir = crate::vm_helpers::use_test_base_dir();
+        let old = crate::vfkit::tests::sample_vm_metadata("vm");
+        let other = VmMetadata {
+            created: "2999-01-01T00:00:00Z".into(),
+            ..old.clone()
+        };
+        let disk = old.disk_image.clone();
+        let replace = |existing: Option<&VmMetadata>| {
+            replace_existing("vm", existing, false, &disk)
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default()
+        };
+
+        // Nothing to replace, whether there was or not
+        assert_eq!(replace(None), "");
+        assert_eq!(replace(Some(&old)), "");
+        // The VM found earlier goes
+        old.save().unwrap();
+        assert_eq!(replace(Some(&old)), "");
+        assert!(VmMetadata::load_if_exists("vm").unwrap().is_none());
+        // One created since then stays
+        other.save().unwrap();
+        for existing in [None, Some(&old)] {
+            assert!(replace(existing).contains("created by another"));
+            assert_eq!(VmMetadata::load("vm").unwrap().created, other.created);
+        }
+    }
+
+    #[test]
+    fn test_create_disk_keeps_others_disks() {
+        let _dir = crate::vm_helpers::use_test_base_dir();
+        let disk = VmMetadata::vms_dir().join("vm.raw");
+        fs::create_dir_all(disk.parent().unwrap()).unwrap();
+        fs::write(&disk, "in use").unwrap();
+        let base = Path::new("/nonexistent/base.raw");
+        let create = |replace| {
+            create_disk("vm", base, &disk, replace)
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default()
+        };
+
+        // A disk that appeared since vm run looked: another command's
+        assert!(create(false).contains("created by another"));
+        // With --replace too, while another VM runs from it
+        VmMetadata {
+            disk_image: disk.to_string_lossy().into_owned(),
+            vfkit: TrackedProcess::current(),
+            ..crate::vfkit::tests::sample_vm_metadata("other")
+        }
+        .save()
+        .unwrap();
+        assert!(create(true).contains("in use by the running VM 'other'"));
+        assert_eq!(fs::read_to_string(&disk).unwrap(), "in use");
+    }
+
+    #[test]
+    fn test_replace_keeps_disk_in_use() {
+        let dir = crate::vm_helpers::use_test_base_dir();
+        let vms_dir = VmMetadata::vms_dir();
+        fs::create_dir_all(&vms_dir).unwrap();
+        let disk = vms_dir.join("x.raw");
+        let key = vms_dir.join("x.raw.key");
+        let base = dir.path().join("base.raw");
+        let user_disk = dir.path().join("user.raw");
+        fs::write(&disk, "old").unwrap();
+        fs::write(&key, "old").unwrap();
+        fs::write(&base, "new").unwrap();
+        let x = VmMetadata {
+            disk_image: disk.to_string_lossy().into_owned(),
+            ..crate::vfkit::tests::sample_vm_metadata("x")
+        };
+        x.save().unwrap();
+        // y, started off x's disk while x was stopped
+        let save_y = |vfkit| {
+            VmMetadata {
+                name: "y".into(),
+                vfkit,
+                ..x.clone()
+            }
+            .save()
+            .unwrap()
+        };
+        save_y(TrackedProcess::current());
+
+        // Neither replacing x from an image nor from another disk removes it
+        for (disk_input, new_disk, base_disk) in [
+            (false, &disk, Some(base.as_path())),
+            (true, &user_disk, None),
+        ] {
+            let err = prepare_disk("x", Some(&x), disk_input, new_disk, base_disk, true)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("in use by the running VM 'y'"), "{err}");
+            assert_eq!(fs::read_to_string(&disk).unwrap(), "old");
+            assert!(key.exists());
+            assert_eq!(VmMetadata::load("x").unwrap().created, x.created);
+        }
+        // Once y stopped, it does
+        save_y(TrackedProcess::NONE);
+        prepare_disk("x", Some(&x), false, &disk, Some(&base), true).unwrap();
+        assert_eq!(fs::read_to_string(&disk).unwrap(), "new");
+        assert!(!key.exists());
+        assert!(VmMetadata::load_if_exists("x").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_replacement_keeps_disk() {
+        let own = VmMetadata::vms_dir().join("vm.raw");
+        let own = own.to_str().unwrap();
+        let user = "/data/vm.raw";
+        for (old_disk, disk_input, new_disk, keeps) in [
+            // From an image again: the same path, but a new disk
+            (own, false, own, false),
+            (own, true, own, true),
+            (own, true, user, false),
+            (user, false, own, true),
+            (user, true, user, true),
+            (user, true, "/data/other.raw", true),
+        ] {
+            let existing = VmMetadata {
+                disk_image: old_disk.to_string(),
+                ..crate::vfkit::tests::sample_vm_metadata("vm")
+            };
+            assert_eq!(
+                replacement_keeps_disk(&existing, disk_input, new_disk),
+                keeps,
+                "{old_disk} {disk_input} {new_disk}"
+            );
+        }
+    }
 }

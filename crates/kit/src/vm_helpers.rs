@@ -492,10 +492,11 @@ pub trait VmMetadataStore: serde::Serialize + serde::de::DeserializeOwned + Size
     /// Lock the VMs directory against other bcvk processes doing the same,
     /// until the returned file is closed.
     ///
-    /// Choosing a name for a new VM, and releasing what a VM that is gone
-    /// left under its name, happen under this lock, so that two processes
-    /// can't take one name, nor one release resources that another just
-    /// started under that name.
+    /// Choosing a name for a new ephemeral VM, and releasing what a VM that
+    /// is gone left under its name, happen under this lock, so that two
+    /// processes can't take one name, nor one release resources that
+    /// another just started under that name. So does starting a persistent
+    /// VM, so that two processes can't start VMs off one disk.
     fn lock() -> color_eyre::Result<std::fs::File> {
         let dir = Self::vms_dir();
         std::fs::create_dir_all(&dir)?;
@@ -557,6 +558,18 @@ pub trait VmMetadataStore: serde::Serialize + serde::de::DeserializeOwned + Size
         if let Ok(path) = Self::metadata_path(name) {
             remove_file_if_exists(&path);
         }
+    }
+
+    /// Every VM's metadata.
+    ///
+    /// Fails on a metadata file that can't be read or parsed, naming it,
+    /// such as one from an earlier build (see [`Self::parse`]): a check
+    /// that no running VM uses something must not miss one.
+    fn list_all() -> color_eyre::Result<Vec<Self>> {
+        read_all_metadata(&Self::vms_dir())?
+            .into_iter()
+            .map(|(_, meta)| meta)
+            .collect()
     }
 
     /// The metadata of every VM that can be read, warning about the
@@ -1278,6 +1291,12 @@ mod tests {
             std::thread::sleep(PROCESS_EXIT_POLL_INTERVAL);
         }
         // The lock file isn't metadata
+        assert_eq!(TestMetadata::list_all().unwrap().len(), 1);
+        // Metadata that can't be read fails list_all(), and is skipped by
+        // list_readable()
+        std::fs::write(dir.path().join("old.json"), r#"{"name": "old", "pid": 12}"#).unwrap();
+        let err = TestMetadata::list_all().unwrap_err().to_string();
+        assert!(err.contains("old.json"), "{err}");
         assert_eq!(TestMetadata::list_readable().unwrap().len(), 1);
     }
 

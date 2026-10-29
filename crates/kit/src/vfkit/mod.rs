@@ -4,10 +4,12 @@
 //! run, list, ssh, stop, start, rm, rm-all, inspect
 
 use std::path::{Path, PathBuf};
-use std::process::Child;
 
 use clap::Subcommand;
-use color_eyre::Result;
+use color_eyre::{
+    eyre::{bail, eyre},
+    Result,
+};
 use tracing::info;
 
 use crate::vm_helpers::TrackedProcess;
@@ -147,46 +149,114 @@ impl VmMetadata {
     pub fn stop_processes(&self, force: bool) {
         crate::vm_helpers::stop_vm_processes(self.vfkit, self.gvproxy, force);
     }
+
+    /// Whether bcvk made the VM's disk, from a container image, so that
+    /// it goes with the VM; otherwise it is the user's own.
+    pub fn has_own_disk(&self) -> bool {
+        Path::new(&self.disk_image).starts_with(Self::vms_dir())
+    }
 }
 
-/// Start gvproxy and vfkit for a persistent VM, forward its ports and wait
-/// for SSH; on failure, nothing is left running.
+/// Whether [`launch`] starts a VM just created, which has no saved
+/// metadata yet, or one whose metadata is saved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Launch {
+    /// `vm run`
+    New,
+    /// `vm start`
+    Saved,
+}
+
+/// Fail if a running VM other than the named one uses `disk`: two VMs
+/// writing to one disk would corrupt it.
 ///
-/// Returns the vfkit and gvproxy processes.
-pub(crate) fn launch(meta: &VmMetadata) -> Result<(Child, Child)> {
+/// Fails on metadata it can't read too, see [`VmMetadataStore::list_all`].
+pub(crate) fn check_disk_not_in_use(name: &str, disk: &str) -> Result<()> {
+    if let Some(other) = VmMetadata::list_all()?
+        .into_iter()
+        .find(|vm| vm.name != name && vm.disk_image == disk && vm.is_alive())
+    {
+        bail!(
+            "disk image {disk} is in use by the running VM '{}'",
+            other.name
+        );
+    }
+    Ok(())
+}
+
+/// Fail if the VM, or another one using its disk, runs already, see
+/// [`check_disk_not_in_use`]; or if its saved metadata isn't the one
+/// [`launch`] started from, as another bcvk command created or removed
+/// the VM meanwhile.
+fn check_launch(meta: &VmMetadata, launch: Launch) -> Result<()> {
+    check_disk_not_in_use(&meta.name, &meta.disk_image)?;
+    let name = &meta.name;
+    match (VmMetadata::load_if_exists(name)?, launch) {
+        (Some(saved), _) if saved.is_alive() => Err(eyre!("VM '{name}' is already running")),
+        (Some(saved), Launch::Saved) if saved.created == meta.created => Ok(()),
+        (None, Launch::New) => Ok(()),
+        (Some(_), _) => Err(eyre!(
+            "VM '{name}' was created by another bcvk command meanwhile"
+        )),
+        (None, Launch::Saved) => Err(eyre!("VM '{name}' was removed meanwhile")),
+    }
+}
+
+/// Start gvproxy and vfkit for a persistent VM, save its metadata with
+/// them, then forward its ports and wait for SSH. Fails if the VM, or
+/// another one using the same disk, runs already, see [`check_launch`].
+///
+/// `prepare` runs first, for `vm run` to replace an existing VM and
+/// create the disk. It, the check, starting the processes and saving them
+/// happen under the VMs directory lock, so that two bcvk commands
+/// launching VMs off one disk, or the same VM, at the same time can't
+/// both pass the check, and neither can replace a disk the other's VM
+/// runs from: each sees the processes the other started. On failure,
+/// nothing is left running, and the saved metadata says so.
+pub(crate) fn launch(
+    meta: &mut VmMetadata,
+    launch: Launch,
+    prepare: impl FnOnce(&mut VmMetadata) -> Result<()>,
+) -> Result<()> {
     use crate::vm_helpers::{
-        expose_port, gvproxy_socket_paths, setup_ssh_port_forwarding, start_gvproxy,
-        stop_vm_processes, wait_for_ssh, FORWARD_ALL_INTERFACES, GVPROXY_VM_IP,
+        expose_port, gvproxy_socket_paths, setup_ssh_port_forwarding, start_gvproxy, wait_for_ssh,
+        FORWARD_ALL_INTERFACES, GVPROXY_VM_IP,
     };
 
     let (gvproxy_sock, services_sock) = gvproxy_socket_paths(&VmMetadata::vms_dir(), &meta.name)?;
     let services_sock = services_sock.to_string_lossy().to_string();
 
-    info!("starting gvproxy...");
-    let gvproxy = start_gvproxy(&gvproxy_sock.to_string_lossy(), &services_sock)?;
+    {
+        let _lock = VmMetadata::lock()?;
+        prepare(meta)?;
+        check_launch(meta, launch)?;
 
-    let config = crate::vm_helpers::VfkitConfig {
-        vcpus: meta.vcpus,
-        memory_mb: meta.memory_mb,
-        efi_store: Path::new(&meta.efi_store),
-        boot_disk: format!("virtio-blk,path={}", meta.disk_image),
-        gvproxy_sock: &gvproxy_sock,
-        serial_log: Path::new(&meta.serial_log),
-        extra_devices: Vec::new(),
-        gui: meta.gui,
-    };
-    info!("launching vfkit (EFI boot)...");
-    let vfkit = match config.spawn(None) {
-        Ok(child) => child,
-        Err(e) => {
-            stop_vm_processes(
-                TrackedProcess::NONE,
-                TrackedProcess::new(gvproxy.id()),
-                true,
-            );
-            return Err(e);
+        info!("starting gvproxy...");
+        let gvproxy = start_gvproxy(&gvproxy_sock.to_string_lossy(), &services_sock)?;
+        meta.gvproxy = TrackedProcess::new(gvproxy.id());
+
+        let config = crate::vm_helpers::VfkitConfig {
+            vcpus: meta.vcpus,
+            memory_mb: meta.memory_mb,
+            efi_store: Path::new(&meta.efi_store),
+            boot_disk: format!("virtio-blk,path={}", meta.disk_image),
+            gvproxy_sock: &gvproxy_sock,
+            serial_log: Path::new(&meta.serial_log),
+            extra_devices: Vec::new(),
+            gui: meta.gui,
+        };
+        info!("launching vfkit (EFI boot)...");
+        meta.vfkit = TrackedProcess::NONE;
+        match config.spawn(None) {
+            Ok(vfkit) => meta.vfkit = TrackedProcess::new(vfkit.id()),
+            Err(e) => {
+                meta.stop_processes(true);
+                return Err(e);
+            }
         }
-    };
+        meta.state = "running".to_string();
+        meta.save()?;
+    }
 
     let connect = || -> Result<()> {
         info!("setting up SSH port forwarding...");
@@ -203,15 +273,37 @@ pub(crate) fn launch(meta: &VmMetadata) -> Result<(Child, Child)> {
         }
         wait_for_ssh(meta.ssh_port, Path::new(&meta.ssh_key), "root")
     };
-    if let Err(e) = connect() {
-        stop_vm_processes(
-            TrackedProcess::new(vfkit.id()),
-            TrackedProcess::new(gvproxy.id()),
-            true,
-        );
-        return Err(e);
+    connect().inspect_err(|_| {
+        meta.stop_processes(true);
+        if let Err(e) = forget_launch(meta, launch) {
+            tracing::warn!("failed to update the metadata of VM '{}': {e}", meta.name);
+        }
+    })
+}
+
+/// Undo saving the metadata of a VM whose launch failed after starting
+/// it: a new VM's is removed, a saved VM's goes back to stopped. Unless
+/// another bcvk command replaced or removed it since.
+fn forget_launch(meta: &VmMetadata, launch: Launch) -> Result<()> {
+    let _lock = VmMetadata::lock()?;
+    if VmMetadata::load_if_exists(&meta.name)?
+        .is_none_or(|cur| cur.created != meta.created || cur.vfkit != meta.vfkit)
+    {
+        return Ok(());
     }
-    Ok((vfkit, gvproxy))
+    match launch {
+        Launch::New => {
+            VmMetadata::remove(&meta.name);
+            Ok(())
+        }
+        Launch::Saved => VmMetadata {
+            vfkit: TrackedProcess::NONE,
+            gvproxy: TrackedProcess::NONE,
+            state: "stopped".to_string(),
+            ..meta.clone()
+        }
+        .save(),
+    }
 }
 
 #[cfg(test)]
@@ -219,7 +311,7 @@ mod tests {
     use super::*;
     use std::fs;
 
-    fn sample_vm_metadata(name: &str) -> VmMetadata {
+    pub(super) fn sample_vm_metadata(name: &str) -> VmMetadata {
         VmMetadata {
             name: name.to_string(),
             image: None,
@@ -237,6 +329,116 @@ mod tests {
             state: "running".to_string(),
             labels: vec![],
             port_mappings: vec![],
+        }
+    }
+
+    #[test]
+    fn test_check_launch() {
+        let _dir = crate::vm_helpers::use_test_base_dir();
+        let vm = |name: &str, disk: &str, running: bool| VmMetadata {
+            disk_image: disk.to_string(),
+            vfkit: if running {
+                TrackedProcess::current()
+            } else {
+                TrackedProcess::NONE
+            },
+            ..sample_vm_metadata(name)
+        };
+        let check = |meta: &VmMetadata, launch| {
+            check_launch(meta, launch)
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default()
+        };
+
+        let a = vm("a", "/d/a.raw", false);
+        assert_eq!(check(&a, Launch::New), "");
+        assert!(check(&a, Launch::Saved).contains("removed meanwhile"));
+        a.save().unwrap();
+        assert_eq!(check(&a, Launch::Saved), "");
+        assert!(check(&a, Launch::New).contains("created by another"));
+        let recreated = VmMetadata {
+            created: "2999-01-01T00:00:00Z".into(),
+            ..a.clone()
+        };
+        assert!(check(&recreated, Launch::Saved).contains("created by another"));
+        vm("a", "/d/a.raw", true).save().unwrap();
+        assert!(check(&a, Launch::Saved).contains("already running"));
+
+        // Another VM off the same disk, running or not
+        vm("b", "/d/b.raw", false).save().unwrap();
+        assert_eq!(check(&vm("c", "/d/b.raw", false), Launch::New), "");
+        vm("b", "/d/b.raw", true).save().unwrap();
+        assert!(check(&vm("c", "/d/b.raw", false), Launch::New).contains("running VM 'b'"));
+
+        // Metadata that can't be read might be of a VM using the disk
+        fs::write(
+            VmMetadata::metadata_path("old").unwrap(),
+            r#"{"name": "old", "pid": 12}"#,
+        )
+        .unwrap();
+        assert!(check(&vm("d", "/d/d.raw", false), Launch::New).contains("old.json"));
+    }
+
+    #[test]
+    fn test_forget_launch() {
+        let _dir = crate::vm_helpers::use_test_base_dir();
+        let launched = VmMetadata {
+            vfkit: TrackedProcess {
+                pid: 1,
+                started_us: 2,
+            },
+            gvproxy: TrackedProcess {
+                pid: 3,
+                started_us: 4,
+            },
+            ..sample_vm_metadata("vm")
+        };
+        let recreated = VmMetadata {
+            created: "2999-01-01T00:00:00Z".into(),
+            ..launched.clone()
+        };
+        let restarted = VmMetadata {
+            vfkit: TrackedProcess {
+                pid: 5,
+                started_us: 6,
+            },
+            ..launched.clone()
+        };
+
+        for launch in [Launch::New, Launch::Saved] {
+            // Nothing saved: nothing to undo
+            forget_launch(&launched, launch).unwrap();
+            assert!(VmMetadata::load_if_exists("vm").unwrap().is_none());
+
+            // Another command's VM, or a later start of this one, stays
+            for other in [&recreated, &restarted] {
+                other.save().unwrap();
+                forget_launch(&launched, launch).unwrap();
+                let saved = VmMetadata::load("vm").unwrap();
+                assert_eq!((&saved.created, saved.vfkit), (&other.created, other.vfkit));
+            }
+
+            // This launch's is undone
+            launched.save().unwrap();
+            forget_launch(&launched, launch).unwrap();
+            let saved = VmMetadata::load_if_exists("vm").unwrap();
+            match launch {
+                Launch::New => assert!(saved.is_none()),
+                Launch::Saved => {
+                    let saved = saved.unwrap();
+                    assert_eq!(
+                        (&saved.created, saved.vfkit, saved.gvproxy, &*saved.state),
+                        (
+                            &launched.created,
+                            TrackedProcess::NONE,
+                            TrackedProcess::NONE,
+                            "stopped"
+                        )
+                    );
+                    VmMetadata::remove("vm");
+                }
+            }
         }
     }
 
