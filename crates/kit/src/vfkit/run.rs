@@ -56,14 +56,8 @@ pub struct VmRunOpts {
     /// VM name (default: derived from image or disk filename)
     #[clap(long, short)]
     pub name: Option<String>,
-    /// Instance type (e.g., u1.nano, u1.small). Overrides vcpus/memory if specified.
-    #[clap(long)]
-    pub itype: Option<crate::instancetypes::InstanceType>,
-    /// Number of vCPUs (overridden by --itype if specified)
-    #[clap(long)]
-    pub vcpus: Option<u32>,
     #[clap(flatten)]
-    pub memory: crate::common_opts::MemoryOpts,
+    pub size: crate::common_opts::VmSizeOpts,
     /// Path to an existing SSH private key
     #[clap(long)]
     pub ssh_key: Option<String>,
@@ -98,6 +92,10 @@ pub struct VmRunOpts {
     #[clap(long, short = 'd')]
     pub detach: bool,
 }
+
+/// vCPUs of a persistent VM without --vcpus or --itype; ephemeral VMs
+/// get all of the host's.
+const DEFAULT_VCPUS: u32 = 2;
 
 fn validate_labels(labels: &[String]) -> Result<()> {
     for label in labels {
@@ -155,12 +153,8 @@ pub fn run(opts: VmRunOpts) -> Result<()> {
                 .with_context(|| format!("SSH key not found: {p}"))
         })
         .transpose()?;
-    let vcpus = opts.itype.map(|t| t.vcpus()).or(opts.vcpus).unwrap_or(2);
-    let memory_mb = opts
-        .itype
-        .map(|t| t.memory_mb())
-        .map(Ok)
-        .unwrap_or_else(|| crate::utils::parse_memory_to_mb(&opts.memory.memory))?;
+    let vcpus = opts.size.vcpus_or(DEFAULT_VCPUS);
+    let memory_mb = opts.size.memory_mb()?;
 
     // A disk image's key can be looked for now; one made from a container
     // image comes with its disk

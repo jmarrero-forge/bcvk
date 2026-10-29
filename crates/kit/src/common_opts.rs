@@ -57,9 +57,19 @@ impl VmSizeOpts {
 
     /// Get vCPU count, using instancetype if specified, else all host CPUs
     pub fn vcpus(&self) -> u32 {
+        self.vcpus_or_else(default_vcpus)
+    }
+
+    /// Get vCPU count, using instancetype if specified, else `default`
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fn vcpus_or(&self, default: u32) -> u32 {
+        self.vcpus_or_else(|| default)
+    }
+
+    fn vcpus_or_else(&self, default: impl FnOnce() -> u32) -> u32 {
         match self.itype {
             Some(itype) => itype.vcpus(),
-            None => self.vcpus.unwrap_or_else(default_vcpus),
+            None => self.vcpus.unwrap_or_else(default),
         }
     }
 }
@@ -100,6 +110,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(unset.vcpus(), default_vcpus());
+        assert_eq!(unset.vcpus_or(2), 2);
         assert!(default_vcpus() >= 1);
     }
 }
