@@ -15,13 +15,24 @@ pub struct VmStopOpts {
 }
 
 /// Stop a running persistent VM.
+///
+/// gvproxy keeps running, holding the VM's forwarded ports, after the
+/// guest powered itself off, so it is stopped then too.
 pub fn run(opts: VmStopOpts) -> Result<()> {
     let mut meta = VmMetadata::load(&opts.name)?;
-    if !meta.is_alive() {
+    let running = meta.is_alive();
+    if !running && !meta.gvproxy.is_running() {
         bail!("VM '{}' is not running", opts.name);
     }
 
-    info!("stopping VM '{}'...", opts.name);
+    if running {
+        info!("stopping VM '{}'...", opts.name);
+    } else {
+        info!(
+            "VM '{}' already powered off, stopping its gvproxy",
+            opts.name
+        );
+    }
     meta.stop_processes(opts.force);
 
     meta.state = "stopped".to_string();

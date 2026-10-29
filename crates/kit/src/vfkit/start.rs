@@ -25,6 +25,9 @@ pub fn run(opts: VmStartOpts) -> Result<()> {
     if meta.is_alive() {
         bail!("VM '{}' is already running", opts.name);
     }
+    // A gvproxy left from before the guest powered itself off still holds
+    // the VM's ports and sockets
+    meta.stop_processes(true);
 
     if !std::path::Path::new(&meta.disk_image).exists() {
         bail!("disk image not found: {}", meta.disk_image);

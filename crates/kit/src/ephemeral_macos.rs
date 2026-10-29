@@ -80,14 +80,26 @@ impl EphemeralCommands {
     }
 }
 
-fn cmd_ps(json: bool) -> Result<()> {
-    let vms = EphemeralVmMetadata::list_readable()?;
-    for vm in &vms {
-        if !vm.is_alive() {
-            EphemeralVmMetadata::remove(&vm.name);
-        }
+/// Stop what is left of an ephemeral VM and forget it.
+///
+/// Its processes are killed outright, as its root is a read-only export.
+/// The VM must go before the NBD server backing its root filesystem.
+/// gvproxy and the NBD server outlive a VM whose bcvk process didn't
+/// clean up after it (it was killed, say), so they are stopped even when
+/// vfkit has exited.
+fn release(vm: &EphemeralVmMetadata) {
+    crate::vm_helpers::stop_vm_processes(vm.vfkit, vm.gvproxy, true);
+    if let Some(ref name) = vm.nbd_unit {
+        crate::nbd_macos::stop_nbd_server(name, vm.nbd_port);
     }
-    let live: Vec<_> = vms.into_iter().filter(|vm| vm.is_alive()).collect();
+    EphemeralVmMetadata::remove(&vm.name);
+}
+
+fn cmd_ps(json: bool) -> Result<()> {
+    let (live, stale): (Vec<_>, Vec<_>) = EphemeralVmMetadata::list_readable()?
+        .into_iter()
+        .partition(|vm| vm.is_alive());
+    stale.iter().for_each(release);
 
     if json {
         println!("{}", serde_json::to_string_pretty(&live)?);
@@ -136,13 +148,7 @@ fn cmd_rm_all(force: bool) -> Result<()> {
     }
 
     for vm in &vms {
-        // Stop the VM before the NBD server backing its root filesystem,
-        // killing it outright as its root is a read-only export.
-        crate::vm_helpers::stop_vm_processes(vm.vfkit, vm.gvproxy, true);
-        if let Some(ref name) = vm.nbd_unit {
-            crate::nbd_macos::stop_nbd_server(name, vm.nbd_port);
-        }
-        EphemeralVmMetadata::remove(&vm.name);
+        release(vm);
         println!("Removed {}", vm.name);
     }
 
@@ -182,7 +188,7 @@ fn cmd_rm_all(force: bool) -> Result<()> {
 fn cmd_ssh(name: &str, args: &[String]) -> Result<()> {
     let vm = EphemeralVmMetadata::load(name)?;
     if !vm.is_alive() {
-        EphemeralVmMetadata::remove(name);
+        release(&vm);
         bail!("VM '{}' is not running", name);
     }
 

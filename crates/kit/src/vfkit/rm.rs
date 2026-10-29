@@ -38,6 +38,9 @@ pub fn run(opts: VmRmOpts) -> Result<()> {
             name: opts.name.clone(),
             force: opts.force,
         })?;
+    } else {
+        // gvproxy outlives a guest that powered itself off
+        meta.stop_processes(true);
     }
 
     // Remove disk image and SSH keys if they are inside the bcvk vms directory
