@@ -67,66 +67,18 @@ pub fn build_erofs(walk: &WalkResult) -> std::io::Result<ErofsLayout> {
     let dir_blocks_offset = inode_table_offset + inode_table_size;
     let mut dir_data: Vec<u8> = Vec::new();
     let mut dir_block_offsets: Vec<u64> = Vec::new(); // per-directory offset in dir_data
+    let mut dir_sizes: Vec<u64> = Vec::new();
 
     for dir in &walk.dirs {
         let offset = align_up(dir_data.len() as u64, BLOCK_SIZE);
         dir_data.resize(offset as usize, 0);
         dir_block_offsets.push(dir_blocks_offset + offset);
 
-        let mut entries = Vec::new();
-
-        // "." entry
-        entries.push(DirEntryOnDisk {
-            nid: nid(dir.inode_id),
-            file_type: EROFS_FT_DIR,
-            name: b".".to_vec(),
-        });
-
-        // ".." entry (root points to self)
-        let parent_nid = nid(dir.parent_inode_id);
-        entries.push(DirEntryOnDisk {
-            nid: parent_nid,
-            file_type: EROFS_FT_DIR,
-            name: b"..".to_vec(),
-        });
-
-        // children (sorted by name in walk)
-        for child in &dir.children {
-            match child {
-                ChildRef::Dir(di) => {
-                    let child_dir = &walk.dirs[*di];
-                    entries.push(DirEntryOnDisk {
-                        nid: nid(child_dir.inode_id),
-                        file_type: EROFS_FT_DIR,
-                        name: child_dir.name.as_encoded_bytes().to_vec(),
-                    });
-                }
-                ChildRef::File(fi) => {
-                    let file = &walk.files[*fi];
-                    entries.push(DirEntryOnDisk {
-                        nid: nid(file.inode_id),
-                        file_type: EROFS_FT_REG_FILE,
-                        name: file
-                            .host_path
-                            .file_name()
-                            .unwrap_or_default()
-                            .as_encoded_bytes()
-                            .to_vec(),
-                    });
-                }
-                ChildRef::Symlink(si) => {
-                    let symlink = &walk.symlinks[*si];
-                    entries.push(DirEntryOnDisk {
-                        nid: nid(symlink.inode_id),
-                        file_type: EROFS_FT_SYMLINK,
-                        name: symlink.name.clone(),
-                    });
-                }
-            }
-        }
-
+        let start = dir_data.len();
         // Write EROFS directory blocks (splits at 4096-byte boundaries)
-        write_dir_blocks(&mut dir_data, &entries);
+        write_dir_blocks(&mut dir_data, &dir_entries(dir, walk));
+        // Only the last block isn't padded to the block size
+        dir_sizes.push((dir_data.len() - start) as u64);
     }
     let dir_data_size = align_up(dir_data.len() as u64, BLOCK_SIZE);
     dir_data.resize(dir_data_size as usize, 0);
@@ -179,7 +131,7 @@ pub fn build_erofs(walk: &WalkResult) -> std::io::Result<ErofsLayout> {
     // Write inodes
     // Directories
     for (i, dir) in walk.dirs.iter().enumerate() {
-        let dir_size = compute_dir_size(dir, walk);
+        let dir_size = dir_sizes[i];
         let dir_block = (dir_block_offsets[i] - dir_blocks_offset) / BLOCK_SIZE;
         write_inode(
             &mut metadata,
@@ -384,58 +336,50 @@ fn write_dir_blocks(buf: &mut Vec<u8>, entries: &[DirEntryOnDisk]) {
     }
 }
 
-fn compute_dir_size(dir: &DirInfo, walk: &WalkResult) -> u64 {
-    // Build entry list to accurately compute size including block splits
-    let mut entries = Vec::new();
-    entries.push(DirEntryOnDisk {
-        nid: 0,
+/// The entries of a directory, "." and ".." included, sorted by name as
+/// mkfs.erofs sorts them: the kernel finds a name by binary search, so
+/// names sorting before "." (such as "-config") have to come first.
+fn dir_entries(dir: &DirInfo, walk: &WalkResult) -> Vec<DirEntryOnDisk> {
+    let dot = |name: &[u8], inode_id| DirEntryOnDisk {
+        nid: nid(inode_id),
         file_type: EROFS_FT_DIR,
-        name: b".".to_vec(),
-    });
-    entries.push(DirEntryOnDisk {
-        nid: 0,
-        file_type: EROFS_FT_DIR,
-        name: b"..".to_vec(),
-    });
-    for child in &dir.children {
-        let name_len = match child {
-            ChildRef::Dir(di) => walk.dirs[*di].name.len(),
-            ChildRef::File(fi) => walk.files[*fi]
-                .host_path
-                .file_name()
-                .unwrap_or_default()
-                .len(),
-            ChildRef::Symlink(si) => walk.symlinks[*si].name.len(),
-        };
-        entries.push(DirEntryOnDisk {
-            nid: 0,
-            file_type: 0,
-            name: vec![0; name_len],
-        });
-    }
-
-    // Simulate block splitting to get total size
-    let mut total = 0u64;
-    let mut remaining = &entries[..];
-    while !remaining.is_empty() {
-        let mut count = 0;
-        let mut block_size = 0usize;
-        for entry in remaining {
-            let entry_size = 12 + entry.name.len();
-            if block_size + entry_size > BLOCK_SIZE as usize && count > 0 {
-                break;
+        name: name.to_vec(),
+    };
+    // The root's parent is itself
+    let mut entries = vec![dot(b".", dir.inode_id), dot(b"..", dir.parent_inode_id)];
+    entries.extend(dir.children.iter().map(|child| match child {
+        ChildRef::Dir(di) => {
+            let child_dir = &walk.dirs[*di];
+            DirEntryOnDisk {
+                nid: nid(child_dir.inode_id),
+                file_type: EROFS_FT_DIR,
+                name: child_dir.name.as_encoded_bytes().to_vec(),
             }
-            block_size += entry_size;
-            count += 1;
         }
-        remaining = &remaining[count..];
-        if remaining.is_empty() {
-            total += block_size as u64; // last block: actual size
-        } else {
-            total += BLOCK_SIZE; // full block
+        ChildRef::File(fi) => {
+            let file = &walk.files[*fi];
+            DirEntryOnDisk {
+                nid: nid(file.inode_id),
+                file_type: EROFS_FT_REG_FILE,
+                name: file
+                    .host_path
+                    .file_name()
+                    .unwrap_or_default()
+                    .as_encoded_bytes()
+                    .to_vec(),
+            }
         }
-    }
-    total
+        ChildRef::Symlink(si) => {
+            let symlink = &walk.symlinks[*si];
+            DirEntryOnDisk {
+                nid: nid(symlink.inode_id),
+                file_type: EROFS_FT_SYMLINK,
+                name: symlink.name.clone(),
+            }
+        }
+    }));
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    entries
 }
 
 fn align_up(val: u64, align: u64) -> u64 {
@@ -582,5 +526,74 @@ mod tests {
         assert_eq!(le_u64(md, inode + 32), MTIME);
         assert_eq!(le_u32(md, inode + 44), 70_000);
         assert_eq!(layout.file_regions[0].size, SIZE);
+    }
+
+    /// Directory entries are sorted by name, "." and ".." included, in
+    /// each block and across blocks, and the directory's size spans them.
+    #[test]
+    fn test_dir_entries_sorted() {
+        // Some sort before ".", one after every letter
+        let mut names: Vec<String> = ["+x", "-config", "a", "~"].map(String::from).into();
+        // Enough to fill more than one block
+        names.extend((0..400).map(|i| format!("file-{i:04}")));
+        let walk = WalkResult {
+            dirs: vec![DirInfo {
+                name: Default::default(),
+                mode: 0o040755,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+                inode_id: 0,
+                parent_inode_id: 0,
+                children: (0..names.len()).map(ChildRef::File).collect(),
+            }],
+            files: names
+                .iter()
+                .enumerate()
+                .map(|(i, name)| FileEntry {
+                    host_path: format!("/img/{name}").into(),
+                    size: 0,
+                    mode: 0o100644,
+                    uid: 0,
+                    gid: 0,
+                    mtime: 0,
+                    nlink: 1,
+                    inode_id: i as u64 + 1,
+                })
+                .collect(),
+            symlinks: vec![],
+        };
+        let layout = build_erofs(&walk).unwrap();
+        let md = &layout.metadata;
+        let root = BLOCK_SIZE as usize;
+        let size = le_u64(md, root + 8) as usize;
+        let start = le_u32(md, root + 16) as usize * BLOCK_SIZE as usize;
+        assert!(size > BLOCK_SIZE as usize, "{size}");
+
+        let mut found: Vec<&[u8]> = Vec::new();
+        for block_start in (0..size).step_by(BLOCK_SIZE as usize) {
+            let block =
+                &md[start + block_start..start + size.min(block_start + BLOCK_SIZE as usize)];
+            // The first name follows the last 12-byte header
+            let count = le_u16(block, 8) as usize / 12;
+            let mut ends: Vec<usize> = (1..count)
+                .map(|i| le_u16(block, i * 12 + 8) as usize)
+                .collect();
+            ends.push(block.len());
+            let mut name_start = le_u16(block, 8) as usize;
+            for end in ends {
+                // The last name in a block is padded with NULs
+                let name = block[name_start..end].split(|&b| b == 0).next().unwrap();
+                found.push(name);
+                name_start = end;
+            }
+        }
+        assert_eq!(found.len(), names.len() + 2);
+        assert!(found.windows(2).all(|w| w[0] < w[1]), "{found:?}");
+        let mut expected: Vec<&[u8]> = names.iter().map(|n| n.as_bytes()).collect();
+        expected.extend([&b"."[..], b".."]);
+        expected.sort();
+        assert_eq!(found, expected);
+        assert_eq!(expected[..4], [&b"+x"[..], b"-config", b".", b".."]);
     }
 }
