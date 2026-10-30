@@ -9,7 +9,9 @@
 //! Common helpers (gvproxy, SSH, vfkit detection) live in vm_helpers.rs.
 
 use std::fs;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use color_eyre::{eyre::bail, eyre::Context as _, Result};
@@ -141,28 +143,22 @@ pub struct RunEphemeralOpts {
     pub detached_child: bool,
 }
 
-// --- RAII cleanup guard ---
+// --- Owning a VM ---
 
-struct VmCleanup {
-    vfkit: TrackedProcess,
-    gvproxy: TrackedProcess,
-    nbd_unit: Option<String>,
-    nbd_port: Option<u16>,
-    image: String,
+/// An ephemeral VM this process runs, and what it started for it.
+#[derive(Debug)]
+struct OwnedVm {
+    /// Its metadata, which records the processes and NBD server.
+    meta: EphemeralVmMetadata,
+    /// Whether its image is mounted in the podman machine.
     image_mounted: bool,
-    vm_name: String,
 }
 
-impl Drop for VmCleanup {
-    fn drop(&mut self) {
+impl OwnedVm {
+    /// Stop everything this process started for the VM, and forget it.
+    fn release(&self) {
         tracing::debug!("cleaning up VM processes...");
-        // Stop the VM before the NBD server backing its root filesystem.
-        // Its root is a read-only export, so there's no clean shutdown to
-        // wait for.
-        crate::vm_helpers::stop_vm_processes(self.vfkit, self.gvproxy, true);
-        if let Some(ref name) = self.nbd_unit {
-            crate::nbd_macos::stop_nbd_server(name, self.nbd_port);
-        }
+        crate::ephemeral_macos::stop_vm(&self.meta);
         // Release container image overlay mount
         if let Some(machine) = self
             .image_mounted
@@ -178,17 +174,110 @@ impl Drop for VmCleanup {
                     "podman",
                     "image",
                     "umount",
-                    &self.image,
+                    &self.meta.image,
                 ])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status()
             {
-                tracing::debug!("failed to umount image {}: {}", self.image, e);
+                tracing::debug!("failed to umount image {}: {}", self.meta.image, e);
             }
         }
-        EphemeralVmMetadata::remove(&self.vm_name);
+        EphemeralVmMetadata::remove(&self.meta.name);
     }
+}
+
+/// The VM this process runs: released, the name reservation included,
+/// when this is dropped, or when the process gets SIGTERM (as `ephemeral
+/// rm-all` sends) or SIGINT.
+///
+/// What is started for the VM is started in [`VmOwner::start`], which
+/// those signals wait for, so that it is recorded, in the VM's metadata
+/// too, before anything can release the VM.
+#[derive(Debug)]
+struct VmOwner {
+    vm: Arc<Mutex<Option<OwnedVm>>>,
+}
+
+/// Lock an owned VM; `None` once it is released.
+fn lock_vm(vm: &Mutex<Option<OwnedVm>>) -> MutexGuard<'_, Option<OwnedVm>> {
+    // Recorded resources stay valid if a panic interrupted a start
+    vm.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+impl VmOwner {
+    /// Own the VM whose name this process just reserved.
+    fn new(meta: EphemeralVmMetadata) -> Result<Self> {
+        let vm = Arc::new(Mutex::new(Some(OwnedVm {
+            meta,
+            image_mounted: false,
+        })));
+        release_on_termination(Arc::clone(&vm))?;
+        Ok(Self { vm })
+    }
+
+    /// Run `start`, which starts something for the VM and records it,
+    /// then save the VM's metadata, whether `start` succeeded or not.
+    fn start<T>(&self, start: impl FnOnce(&mut OwnedVm) -> Result<T>) -> Result<T> {
+        let mut vm = lock_vm(&self.vm);
+        // A signal released it, and the process is about to exit
+        let vm = vm
+            .as_mut()
+            .ok_or_else(|| color_eyre::eyre::eyre!("the VM was stopped"))?;
+        let started = start(vm);
+        vm.meta.save()?;
+        started
+    }
+}
+
+impl Drop for VmOwner {
+    fn drop(&mut self) {
+        if let Some(vm) = lock_vm(&self.vm).take() {
+            vm.release();
+        }
+    }
+}
+
+/// When this process gets SIGTERM or SIGINT, release the VM and exit, as
+/// those signals would have made it; a second one exits right away.
+fn release_on_termination(vm: Arc<Mutex<Option<OwnedVm>>>) -> Result<()> {
+    use tokio::signal::unix::{signal, Signal, SignalKind};
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("creating the signal handling runtime")?;
+    // From here on, these signals no longer kill the process
+    let (mut term, mut int) = {
+        let _rt = rt.enter();
+        (
+            signal(SignalKind::terminate())?,
+            signal(SignalKind::interrupt())?,
+        )
+    };
+    async fn next_signal(term: &mut Signal, int: &mut Signal) -> i32 {
+        tokio::select! {
+            _ = term.recv() => libc::SIGTERM,
+            _ = int.recv() => libc::SIGINT,
+        }
+    }
+    std::thread::spawn(move || {
+        rt.block_on(async move {
+            let signal = next_signal(&mut term, &mut int).await;
+            info!("stopping the VM (signal {signal}); signal again to exit right away");
+            std::thread::spawn(move || {
+                // Holding the lock until the process exits, so that nothing
+                // more gets started
+                let mut vm = lock_vm(&vm);
+                if let Some(vm) = vm.take() {
+                    vm.release();
+                }
+                std::process::exit(128 + signal);
+            });
+            let signal = next_signal(&mut term, &mut int).await;
+            std::process::exit(128 + signal);
+        })
+    });
+    Ok(())
 }
 
 // --- VM names ---
@@ -199,6 +288,10 @@ const MAX_DEFAULT_NAME_TRIES: u32 = 100;
 /// How long the bcvk process that --detach starts gets to take over the
 /// VM's name.
 const DETACHED_TAKEOVER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long the bcvk process that --detach started gets to exit after
+/// SIGTERM, when it didn't take over the VM's name in time.
+const DETACHED_CHILD_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Reserve the VM's name for this process, saving its metadata: `--name`,
 /// which no running VM may have (its NBD unit, SSH key and sockets are
@@ -306,18 +399,11 @@ fn run_vfkit(opts: RunEphemeralOpts) -> Result<()> {
         reserve_vm_name(&opts, digest_short)?
     };
     let vm_name = vm.name.clone();
+    let ssh_key_path = PathBuf::from(&vm.ssh_key);
+    let serial_log = PathBuf::from(&vm.serial_log);
     // Undoes everything from here on, the name reservation included, when
     // this function returns, however it does.
-    let mut cleanup = VmCleanup {
-        vfkit: TrackedProcess::NONE,
-        gvproxy: TrackedProcess::NONE,
-        nbd_unit: None,
-        nbd_port: None,
-        image: opts.image.clone(),
-        image_mounted: false,
-        vm_name: vm_name.clone(),
-    };
-    let ssh_key_path = std::path::PathBuf::from(&vm.ssh_key);
+    let owner = VmOwner::new(vm)?;
 
     let mut ssh_pubkey = String::new();
     if opts.ssh_keygen || !opts.execute.is_empty() {
@@ -347,26 +433,33 @@ fn run_vfkit(opts: RunEphemeralOpts) -> Result<()> {
     crate::nbd_macos::deploy_nbd_server(&machine)?;
 
     // Get container image merged overlay path
-    let merged_path = crate::nbd_macos::get_merged_path(&machine, rootful, &opts.image)?;
-    cleanup.image_mounted = true;
+    let merged_path = owner.start(|vm| {
+        let merged_path = crate::nbd_macos::get_merged_path(&machine, rootful, &opts.image)?;
+        vm.image_mounted = true;
+        Ok(merged_path)
+    })?;
     info!("overlay merged: {}", merged_path);
 
     let nbd_port = crate::nbd_macos::find_available_nbd_port();
     info!("NBD transport: TCP (port {})", nbd_port);
     let nbd_unit_name = crate::nbd_macos::nbd_unit_name(&vm_name);
-    // Before starting it, as a failed start can leave the unit running (a
-    // server still scanning the image when the wait for it times out, say)
-    // and the port forwarded
-    cleanup.nbd_unit = Some(nbd_unit_name.clone());
-    cleanup.nbd_port = Some(nbd_port);
-    crate::nbd_macos::start_nbd_server(
-        &machine,
-        &merged_path,
-        &cmdline,
-        &ssh_pubkey,
-        nbd_port,
-        &vm_name,
-    )?;
+    owner.start(|vm| {
+        // Before starting it, as a failed start can leave the unit running
+        // (a server still scanning the image when the wait for it times
+        // out, say) and the port forwarded; saved, in case this process is
+        // killed meanwhile
+        vm.meta.nbd_unit = Some(nbd_unit_name);
+        vm.meta.nbd_port = Some(nbd_port);
+        vm.meta.save()?;
+        crate::nbd_macos::start_nbd_server(
+            &machine,
+            &merged_path,
+            &cmdline,
+            &ssh_pubkey,
+            nbd_port,
+            &vm_name,
+        )
+    })?;
 
     let vcpus = opts.size.vcpus();
     let memory_mb = opts.size.memory_mb()?;
@@ -376,11 +469,13 @@ fn run_vfkit(opts: RunEphemeralOpts) -> Result<()> {
         crate::vm_helpers::gvproxy_socket_paths(&cache_base, &vm_name)?;
     let services_sock_str = services_sock.to_string_lossy().to_string();
     info!("starting gvproxy...");
-    let gvproxy_child = start_gvproxy(&gvproxy_sock.to_string_lossy(), &services_sock_str)?;
-    cleanup.gvproxy = TrackedProcess::new(gvproxy_child.id());
+    owner.start(|vm| {
+        let gvproxy = start_gvproxy(&gvproxy_sock.to_string_lossy(), &services_sock_str)?;
+        vm.meta.gvproxy = TrackedProcess::new(gvproxy.id());
+        Ok(())
+    })?;
 
     let efi_store = cache_base.join(format!("{}-efi-vars", vm_name));
-    let serial_log = std::path::PathBuf::from(&vm.serial_log);
     let vsock_sock = cache_base.join(format!("{}-vsock.sock", vm_name));
     let vfkit_config = crate::vm_helpers::VfkitConfig {
         vcpus,
@@ -399,23 +494,17 @@ fn run_vfkit(opts: RunEphemeralOpts) -> Result<()> {
         gui: opts.gui,
     };
 
-    info!("launching vfkit...");
-    let vfkit_log = cache_base.join(format!("{}-vfkit.log", vm_name));
-    let mut vfkit_child = vfkit_config.spawn(Some(&vfkit_log))?;
-    cleanup.vfkit = TrackedProcess::new(vfkit_child.id());
-
     let ssh_port = find_available_ssh_port();
     debug!("allocated SSH port: {}", ssh_port);
 
-    let metadata = EphemeralVmMetadata {
-        vfkit: cleanup.vfkit,
-        gvproxy: cleanup.gvproxy,
-        ssh_port,
-        nbd_unit: Some(nbd_unit_name.clone()),
-        nbd_port: Some(nbd_port),
-        ..vm
-    };
-    metadata.save()?;
+    info!("launching vfkit...");
+    let vfkit_log = cache_base.join(format!("{}-vfkit.log", vm_name));
+    let mut vfkit_child = owner.start(|vm| {
+        let vfkit = vfkit_config.spawn(Some(&vfkit_log))?;
+        vm.meta.vfkit = TrackedProcess::new(vfkit.id());
+        vm.meta.ssh_port = ssh_port;
+        Ok(vfkit)
+    })?;
 
     if opts.ssh_keygen || !opts.execute.is_empty() {
         info!("setting up SSH port forwarding...");
@@ -445,7 +534,7 @@ fn run_vfkit(opts: RunEphemeralOpts) -> Result<()> {
         if std::io::stdin().is_terminal() {
             let status = run_ssh_interactive(ssh_port, &ssh_key_path, "root")?;
             let exit_code = status.code().unwrap_or(1);
-            drop(cleanup);
+            drop(owner);
             std::process::exit(exit_code);
         }
     }
@@ -522,7 +611,9 @@ fn start_detached_child(opts: &RunEphemeralOpts, vm: &EphemeralVmMetadata) -> Re
             Duration::from_millis(50),
         );
     if taken_over.is_err() {
-        crate::vm_helpers::terminate_process(child, "bcvk", Duration::ZERO, true);
+        // It may have taken over just after the last check, and then tears
+        // the VM down on SIGTERM
+        crate::vm_helpers::terminate_process(child, "bcvk", DETACHED_CHILD_STOP_TIMEOUT, false);
     }
     taken_over.map(|_| ())
 }

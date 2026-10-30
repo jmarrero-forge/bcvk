@@ -81,21 +81,65 @@ impl EphemeralCommands {
     }
 }
 
-/// Stop what is left of an ephemeral VM and forget it.
+/// How long the bcvk process running an ephemeral VM gets to tear it
+/// down after SIGTERM. It may first have to finish starting the NBD
+/// server, which can take half a minute.
+const OWNER_STOP_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Stop an ephemeral VM's processes and its NBD server.
 ///
-/// Its processes are killed outright, as its root is a read-only export,
-/// its bcvk process first, so that it doesn't start anything more. The
-/// VM must go before the NBD server backing its root filesystem. gvproxy
+/// The processes are killed outright, as the VM's root is a read-only
+/// export, and the VM must go before the NBD server backing it. gvproxy
 /// and the NBD server outlive a VM whose bcvk process didn't clean up
 /// after it (it was killed, say), so they are stopped even when vfkit has
 /// exited.
-pub(crate) fn release(vm: &EphemeralVmMetadata) {
-    crate::vm_helpers::terminate_process(vm.owner, "bcvk", Duration::ZERO, true);
+pub(crate) fn stop_vm(vm: &EphemeralVmMetadata) {
     crate::vm_helpers::stop_vm_processes(vm.vfkit, vm.gvproxy, true);
     if let Some(ref name) = vm.nbd_unit {
         crate::nbd_macos::stop_nbd_server(name, vm.nbd_port);
     }
+}
+
+/// Stop what is left of an ephemeral VM, see [`stop_vm`], and forget it.
+///
+/// For a VM whose bcvk process is gone: one still running would go on
+/// starting things, so it is killed first, but it is better asked to
+/// clean up itself, see [`remove`].
+pub(crate) fn release(vm: &EphemeralVmMetadata) {
+    crate::vm_helpers::terminate_process(vm.owner, "bcvk", Duration::ZERO, true);
+    stop_vm(vm);
     EphemeralVmMetadata::remove(&vm.name);
+}
+
+/// Remove an ephemeral VM, running or not.
+///
+/// Its bcvk process, if it still runs, tears it down itself on SIGTERM,
+/// even while it is still starting it; whatever is left after that, or by
+/// a bcvk process that was killed, is released here, under the VM names
+/// lock. A detached VM's bcvk process may have taken the VM over from
+/// the one starting it meanwhile, which then gets the same treatment.
+fn remove(vm: &EphemeralVmMetadata) -> Result<()> {
+    let mut owner = vm.owner;
+    // The bcvk process --detach started, then the one it started
+    for _ in 0..2 {
+        crate::vm_helpers::terminate_process(owner, "bcvk", OWNER_STOP_TIMEOUT, false);
+        let _lock = EphemeralVmMetadata::lock()?;
+        match EphemeralVmMetadata::load_if_exists(&vm.name)? {
+            Some(cur) if cur.same_vm(vm) && cur.owner != owner && cur.owner.is_running() => {
+                owner = cur.owner;
+            }
+            Some(cur) if cur.same_vm(vm) => {
+                release(&cur);
+                return Ok(());
+            }
+            // Gone, or a new VM under that name
+            _ => return Ok(()),
+        }
+    }
+    Err(color_eyre::eyre::eyre!(
+        "the bcvk process running VM '{}' kept changing",
+        vm.name
+    ))
 }
 
 /// Release a VM found gone, see [`release`], if it still is: under the
@@ -173,8 +217,10 @@ fn cmd_rm_all(force: bool) -> Result<()> {
     }
 
     for vm in &vms {
-        release(vm);
-        println!("Removed {}", vm.name);
+        match remove(vm) {
+            Ok(()) => println!("Removed {}", vm.name),
+            Err(e) => tracing::warn!("failed to remove ephemeral VM '{}': {e}", vm.name),
+        }
     }
 
     // Sweep orphaned resources inside podman machine
@@ -250,4 +296,61 @@ fn cmd_ssh(name: &str, args: &[String]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vm_helpers::TrackedProcess;
+
+    /// A process to stand in for a VM's bcvk process, which exits on SIGTERM.
+    fn spawn_owner() -> (std::process::Child, TrackedProcess) {
+        let child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let tracked = TrackedProcess::new(child.id());
+        (child, tracked)
+    }
+
+    #[test]
+    fn test_remove() {
+        let _dir = crate::vm_helpers::use_test_base_dir();
+        let vm = |owner| EphemeralVmMetadata {
+            owner,
+            ..EphemeralVmMetadata::reserved("vm", "img", false)
+        };
+
+        // Its bcvk process is stopped, and then what is left released
+        let (_child, owner) = spawn_owner();
+        let running = vm(owner);
+        running.save().unwrap();
+        remove(&running).unwrap();
+        assert!(!owner.is_running());
+        assert!(EphemeralVmMetadata::load_if_exists("vm").unwrap().is_none());
+
+        // ... and the one that took the VM over meanwhile, as a detached
+        // VM's does from the one that started it
+        let (_parent, parent) = spawn_owner();
+        let (_child, child) = spawn_owner();
+        let starting = vm(parent);
+        EphemeralVmMetadata {
+            owner: child,
+            ..starting.clone()
+        }
+        .save()
+        .unwrap();
+        remove(&starting).unwrap();
+        assert!(!parent.is_running() && !child.is_running());
+        assert!(EphemeralVmMetadata::load_if_exists("vm").unwrap().is_none());
+
+        // A new VM that took the name meanwhile is left alone
+        let new_vm = EphemeralVmMetadata {
+            created: "2999-01-01T00:00:00Z".into(),
+            ..vm(TrackedProcess::current())
+        };
+        new_vm.save().unwrap();
+        remove(&vm(TrackedProcess::NONE)).unwrap();
+        assert!(EphemeralVmMetadata::load("vm").unwrap().same_vm(&new_vm));
+    }
 }
