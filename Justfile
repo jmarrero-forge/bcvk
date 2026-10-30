@@ -3,7 +3,7 @@ PRIMARY_IMAGE := "quay.io/centos-bootc/centos-bootc:stream10"
 # <https://github.com/bootc-dev/bcvk/issues/153>
 ALL_BASE_IMAGES := "quay.io/fedora/fedora-bootc:43 quay.io/fedora/fedora-bootc:44 quay.io/centos-bootc/centos-bootc:stream9 quay.io/centos-bootc/centos-bootc:stream10 quay.io/almalinuxorg/almalinux-bootc:10.0"
 
-# Build the native binary
+# Build the native binary (cross-compiles NBD server on non-Linux hosts)
 build:
    make
 
@@ -17,8 +17,16 @@ unit *ARGS:
     set -euo pipefail
     if command -v cargo-nextest &> /dev/null; then
         cargo nextest run {{ ARGS }}
+        nbd=(cargo nextest run --no-tests=pass -p bcvk-nbd)
     else
         cargo test {{ ARGS }}
+        nbd=(cargo test -p bcvk-nbd)
+    fi
+    # bcvk-nbd only builds for Linux, so it isn't a default workspace member.
+    # ARGS (a filter, -p, --lib...) are meant for the run above, so run
+    # bcvk-nbd's tests only in a plain `just unit`.
+    if test "$(uname -s)" = Linux && test -z "{{ ARGS }}"; then
+        "${nbd[@]}"
     fi
 
 pull-test-images:

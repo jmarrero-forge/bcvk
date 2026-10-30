@@ -1,13 +1,19 @@
-use camino::{Utf8Path, Utf8PathBuf};
-use color_eyre::eyre::{eyre, Context};
+//! Cross-platform utility functions.
+
+use color_eyre::eyre::{eyre, Context as _};
 use color_eyre::Result;
 use indicatif::ProgressBar;
-use std::io::{Seek as _, Write as _};
-use std::os::fd::OwnedFd;
 use std::time::{Duration, Instant};
-
-use cap_std_ext::cap_std::io_lifetimes::AsFilelike as _;
 use tracing::debug;
+
+#[cfg(target_os = "linux")]
+use camino::{Utf8Path, Utf8PathBuf};
+#[cfg(target_os = "linux")]
+use cap_std_ext::cap_std::io_lifetimes::AsFilelike as _;
+#[cfg(target_os = "linux")]
+use std::io::{Seek as _, Write as _};
+#[cfg(target_os = "linux")]
+use std::os::fd::OwnedFd;
 
 /// Wait for a condition to become ready with progress indication
 ///
@@ -18,13 +24,16 @@ use tracing::debug;
 ///
 /// * `progress` - Progress bar to update with attempt status
 /// * `message` - Message to display (e.g., "Waiting for SSH")
-/// * `test_fn` - Function that tests the readiness condition, returns Ok(true) on success
+/// * `test_fn` - Function that tests the readiness condition: `Ok(true)` when ready,
+///   `Ok(false)` to retry after `poll_interval`, and `Err` to stop polling
+///   immediately (for failures that retrying won't fix)
 /// * `timeout` - Maximum duration to wait
 /// * `poll_interval` - Duration to wait between test attempts
 ///
 /// # Returns
 ///
-/// Returns the elapsed duration and progress bar on success, or an error on timeout
+/// Returns the elapsed duration and progress bar on success, or an error on
+/// timeout or when `test_fn` fails
 pub fn wait_for_readiness<F>(
     progress: ProgressBar,
     message: &str,
@@ -60,7 +69,7 @@ where
                 debug!("Readiness check attempt {} returned false", attempt);
             }
             Err(e) => {
-                debug!("Readiness check attempt {} failed: {}", attempt, e);
+                return Err(e);
             }
         }
 
@@ -75,8 +84,28 @@ where
     ))
 }
 
+/// Ask the user to confirm a destructive operation; the default answer is no.
+///
+/// Fails without a terminal (dialoguer reads stdin and draws on stderr)
+/// rather than reading an answer from a pipe; the commands using this take
+/// `--force` to skip the question.
+pub(crate) fn confirm(prompt: &str) -> Result<bool> {
+    use std::io::IsTerminal as _;
+    if !(std::io::stdin().is_terminal() && std::io::stderr().is_terminal()) {
+        return Err(eyre!(
+            "{prompt}: cannot ask for confirmation without a terminal (use --force)"
+        ));
+    }
+    dialoguer::Confirm::new()
+        .with_prompt(prompt)
+        .default(false)
+        .interact()
+        .context("Reading confirmation")
+}
+
 /// Creates a sealed memory file descriptor for secure data transfer.
 /// The sealed memfd cannot be modified after creation, providing tamper protection.
+#[cfg(target_os = "linux")]
 #[allow(dead_code)]
 pub(crate) fn impl_sealed_memfd(description: &str, content: &[u8]) -> Result<OwnedFd> {
     use rustix::fs::{MemfdFlags, SealFlags};
@@ -98,6 +127,7 @@ pub(crate) fn impl_sealed_memfd(description: &str, content: &[u8]) -> Result<Own
 }
 
 /// Detect the container storage path using podman system info
+#[cfg(target_os = "linux")]
 pub(crate) fn detect_container_storage_path() -> Result<Utf8PathBuf> {
     use std::process::Command;
 
@@ -144,6 +174,7 @@ pub(crate) fn detect_container_storage_path() -> Result<Utf8PathBuf> {
 }
 
 /// Validate that a container storage path exists and has the expected structure
+#[cfg(target_os = "linux")]
 pub(crate) fn validate_container_storage_path(path: &Utf8Path) -> Result<()> {
     if !path.exists() {
         return Err(eyre!("Container storage path does not exist: {}", path));
@@ -215,36 +246,73 @@ pub(crate) fn parse_memory_to_mb(memory_str: &str) -> Result<u32> {
     }
 
     // Try to strip unit suffix, checking case-insensitively
-    let (number_str, unit) = if let Some(num) = memory_str
+    let (number_str, mib_per_unit) = if let Some(num) = memory_str
         .strip_suffix('G')
         .or_else(|| memory_str.strip_suffix('g'))
     {
-        (num, "GiB")
+        (num, 1024.0)
     } else if let Some(num) = memory_str
         .strip_suffix('M')
         .or_else(|| memory_str.strip_suffix('m'))
     {
-        (num, "MiB")
+        (num, 1.0)
     } else if let Some(num) = memory_str
         .strip_suffix('K')
         .or_else(|| memory_str.strip_suffix('k'))
     {
-        (num, "KiB")
+        (num, 1.0 / 1024.0)
     } else {
         // No suffix, assume megabytes
-        (memory_str, "MiB")
+        (memory_str, 1.0)
     };
 
     let number: f64 = number_str
         .parse()
         .context("Invalid number in memory specification")?;
 
-    // Use libvirt helper to get bytes per unit
-    let bytes_per_unit =
-        crate::libvirt::unit_to_bytes(unit).ok_or_else(|| eyre!("Unknown unit: {}", unit))? as f64;
+    Ok((number * mib_per_unit) as u32)
+}
 
-    let mib = 1024.0 * 1024.0;
-    let total_mb = (number * bytes_per_unit) / mib;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    Ok(total_mb as u32)
+    #[test]
+    fn test_parse_size() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        for (input, expected) in [
+            ("10G", 10 * GIB),
+            ("20GB", 20 * GIB),
+            ("5120M", 5120 * 1024 * 1024),
+            ("512MB", 512 * 1024 * 1024),
+            ("1024K", 1024 * 1024),
+            ("1TB", 1024 * GIB),
+            ("1073741824", GIB),
+            ("100B", 100),
+            (" 2g ", 2 * GIB),
+        ] {
+            assert_eq!(parse_size(input).unwrap(), expected, "{input}");
+        }
+        for input in ["", "abc", "10X", "1.5G"] {
+            assert!(parse_size(input).is_err(), "{input}");
+        }
+    }
+
+    #[test]
+    fn test_parse_memory_to_mb() {
+        for (input, expected) in [
+            ("4G", 4096),
+            ("1g", 1024),
+            ("1.5G", 1536),
+            ("2048M", 2048),
+            ("256m", 256),
+            ("512", 512),
+            ("2048K", 2),
+        ] {
+            assert_eq!(parse_memory_to_mb(input).unwrap(), expected, "{input}");
+        }
+        for input in ["", "abc", "4T"] {
+            assert!(parse_memory_to_mb(input).is_err(), "{input}");
+        }
+    }
 }
