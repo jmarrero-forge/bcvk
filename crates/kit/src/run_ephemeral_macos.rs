@@ -10,8 +10,9 @@
 
 use std::fs;
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
-use color_eyre::{eyre::bail, Result};
+use color_eyre::{eyre::bail, eyre::Context as _, Result};
 use tracing::{debug, info};
 
 use crate::vm_helpers::{
@@ -34,8 +35,11 @@ pub struct EphemeralVmMetadata {
     pub name: String,
     /// Container image reference used to boot the VM.
     pub image: String,
-    /// The vfkit process; for a detached VM, until that is started, the
-    /// bcvk process starting it.
+    /// The bcvk process running the VM, which holds its name from before
+    /// anything is started under it, and cleans up after it.
+    #[serde(default)]
+    pub owner: TrackedProcess,
+    /// The vfkit process.
     #[serde(default)]
     pub vfkit: TrackedProcess,
     /// The gvproxy network proxy process.
@@ -69,9 +73,37 @@ impl crate::vm_helpers::VmMetadataStore for EphemeralVmMetadata {
 }
 
 impl EphemeralVmMetadata {
-    /// Check if the VM process is still alive.
+    /// The metadata of a VM whose name this process reserves, see
+    /// [`reserve_vm_name`]; `detached` adds the log of the bcvk process
+    /// that --detach starts.
+    pub(crate) fn reserved(name: &str, image: &str, detached: bool) -> Self {
+        let base = ephemeral_base_dir();
+        let path = |file: String| base.join(file).to_string_lossy().to_string();
+        Self {
+            name: name.to_string(),
+            image: image.to_string(),
+            owner: TrackedProcess::current(),
+            vfkit: TrackedProcess::NONE,
+            gvproxy: TrackedProcess::NONE,
+            ssh_port: 0,
+            ssh_key: path(format!("{name}-key")),
+            serial_log: path(format!("{name}-serial.log")),
+            log_path: detached.then(|| path(format!("bcvk-{name}.log"))),
+            created: chrono::Utc::now().to_rfc3339(),
+            nbd_unit: None,
+            nbd_port: None,
+        }
+    }
+
+    /// Whether the VM is running, or its bcvk process still starting it.
     pub fn is_alive(&self) -> bool {
-        self.vfkit.is_running()
+        self.vfkit.is_running() || self.owner.is_running()
+    }
+
+    /// Whether this and `other` are the metadata of the same VM, rather
+    /// than of two that had the same name one after the other.
+    pub fn same_vm(&self, other: &Self) -> bool {
+        self.name == other.name && self.created == other.created
     }
 }
 
@@ -103,6 +135,10 @@ pub struct RunEphemeralOpts {
     /// Enable debug mode (reserved for future use)
     #[clap(long)]
     pub debug: bool,
+    /// Set on the bcvk process that --detach starts, which takes over
+    /// the VM name (--name) that its parent reserved
+    #[clap(long, hide = true, requires = "name")]
+    pub detached_child: bool,
 }
 
 // --- RAII cleanup guard ---
@@ -113,6 +149,7 @@ struct VmCleanup {
     nbd_unit: Option<String>,
     nbd_port: Option<u16>,
     image: String,
+    image_mounted: bool,
     vm_name: String,
 }
 
@@ -127,7 +164,11 @@ impl Drop for VmCleanup {
             crate::nbd_macos::stop_nbd_server(name, self.nbd_port);
         }
         // Release container image overlay mount
-        if let Ok(machine) = detect_machine_name() {
+        if let Some(machine) = self
+            .image_mounted
+            .then(detect_machine_name)
+            .and_then(Result::ok)
+        {
             if let Err(e) = Command::new("podman")
                 .args([
                     "machine",
@@ -148,6 +189,77 @@ impl Drop for VmCleanup {
         }
         EphemeralVmMetadata::remove(&self.vm_name);
     }
+}
+
+// --- VM names ---
+
+/// How many numbered variants of the default VM name to try.
+const MAX_DEFAULT_NAME_TRIES: u32 = 100;
+
+/// How long the bcvk process that --detach starts gets to take over the
+/// VM's name.
+const DETACHED_TAKEOVER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Reserve the VM's name for this process, saving its metadata: `--name`,
+/// which no running VM may have (its NBD unit, SSH key and sockets are
+/// named after it, so starting a second one would take them from the
+/// first), or else one derived from the image digest, numbered when that
+/// is taken. What a VM that is gone left under that name is released.
+///
+/// Under the VM names lock, so that runs at the same time get different
+/// names.
+fn reserve_vm_name(opts: &RunEphemeralOpts, digest_short: &str) -> Result<EphemeralVmMetadata> {
+    let candidates: Vec<String> = match &opts.name {
+        Some(name) => vec![name.clone()],
+        None => {
+            let base = format!("ephemeral-{}", &digest_short[..8.min(digest_short.len())]);
+            (1..=MAX_DEFAULT_NAME_TRIES)
+                .map(|i| match i {
+                    1 => base.clone(),
+                    i => format!("{base}-{i}"),
+                })
+                .collect()
+        }
+    };
+    let _lock = EphemeralVmMetadata::lock()?;
+    for name in candidates {
+        crate::vm_helpers::gvproxy_socket_paths(&ephemeral_base_dir(), &name)?;
+        if let Some(vm) = EphemeralVmMetadata::load_if_exists(&name)? {
+            if vm.is_alive() {
+                if opts.name.is_some() {
+                    bail!(
+                        "an ephemeral VM named '{name}' is already running; choose another \
+                         --name, or remove it with `bcvk ephemeral rm-all`"
+                    );
+                }
+                continue;
+            }
+            crate::ephemeral_macos::release(&vm);
+        }
+        let vm = EphemeralVmMetadata::reserved(&name, &opts.image, opts.detach);
+        vm.save()?;
+        return Ok(vm);
+    }
+    Err(color_eyre::eyre::eyre!(
+        "{MAX_DEFAULT_NAME_TRIES} ephemeral VMs of this image are running; use --name"
+    ))
+}
+
+/// Take over the VM name that the bcvk process which started this one
+/// with --detach reserved, see [`run_detached`].
+fn take_over_vm_name(name: &str) -> Result<EphemeralVmMetadata> {
+    let parent = TrackedProcess::new(std::os::unix::process::parent_id());
+    let _lock = EphemeralVmMetadata::lock()?;
+    let mut vm = EphemeralVmMetadata::load_if_exists(name)?
+        .filter(|vm| parent != TrackedProcess::NONE && vm.owner == parent)
+        .ok_or_else(|| {
+            color_eyre::eyre::eyre!(
+                "VM name '{name}' isn't reserved by the bcvk process that started this one"
+            )
+        })?;
+    vm.owner = TrackedProcess::current();
+    vm.save()?;
+    Ok(vm)
 }
 
 // --- Main entry point ---
@@ -187,11 +299,25 @@ fn run_vfkit(opts: RunEphemeralOpts) -> Result<()> {
     let digest_short = &digest[..16.min(digest.len())];
     info!("image digest: {}...", digest_short);
 
-    let vm_name = opts
-        .name
-        .clone()
-        .unwrap_or_else(|| format!("ephemeral-{}", &digest_short[..8]));
-    let ssh_key_path = cache_base.join(format!("{}-key", vm_name));
+    let vm = if opts.detached_child {
+        // clap requires --name with it
+        take_over_vm_name(opts.name.as_deref().unwrap_or_default())?
+    } else {
+        reserve_vm_name(&opts, digest_short)?
+    };
+    let vm_name = vm.name.clone();
+    // Undoes everything from here on, the name reservation included, when
+    // this function returns, however it does.
+    let mut cleanup = VmCleanup {
+        vfkit: TrackedProcess::NONE,
+        gvproxy: TrackedProcess::NONE,
+        nbd_unit: None,
+        nbd_port: None,
+        image: opts.image.clone(),
+        image_mounted: false,
+        vm_name: vm_name.clone(),
+    };
+    let ssh_key_path = std::path::PathBuf::from(&vm.ssh_key);
 
     let mut ssh_pubkey = String::new();
     if opts.ssh_keygen || !opts.execute.is_empty() {
@@ -222,17 +348,8 @@ fn run_vfkit(opts: RunEphemeralOpts) -> Result<()> {
 
     // Get container image merged overlay path
     let merged_path = crate::nbd_macos::get_merged_path(&machine, rootful, &opts.image)?;
+    cleanup.image_mounted = true;
     info!("overlay merged: {}", merged_path);
-
-    // Undoes everything from here on when this function returns, however it does.
-    let mut cleanup = VmCleanup {
-        vfkit: TrackedProcess::NONE,
-        gvproxy: TrackedProcess::NONE,
-        nbd_unit: None,
-        nbd_port: None,
-        image: opts.image.clone(),
-        vm_name: vm_name.clone(),
-    };
 
     let nbd_port = crate::nbd_macos::find_available_nbd_port();
     info!("NBD transport: TCP (port {})", nbd_port);
@@ -263,7 +380,7 @@ fn run_vfkit(opts: RunEphemeralOpts) -> Result<()> {
     cleanup.gvproxy = TrackedProcess::new(gvproxy_child.id());
 
     let efi_store = cache_base.join(format!("{}-efi-vars", vm_name));
-    let serial_log = cache_base.join(format!("{}-serial.log", vm_name));
+    let serial_log = std::path::PathBuf::from(&vm.serial_log);
     let vsock_sock = cache_base.join(format!("{}-vsock.sock", vm_name));
     let vfkit_config = crate::vm_helpers::VfkitConfig {
         vcpus,
@@ -291,17 +408,12 @@ fn run_vfkit(opts: RunEphemeralOpts) -> Result<()> {
     debug!("allocated SSH port: {}", ssh_port);
 
     let metadata = EphemeralVmMetadata {
-        name: vm_name.clone(),
-        image: opts.image.clone(),
         vfkit: cleanup.vfkit,
         gvproxy: cleanup.gvproxy,
         ssh_port,
-        ssh_key: ssh_key_path.to_string_lossy().to_string(),
-        serial_log: serial_log.to_string_lossy().to_string(),
-        log_path: None,
-        created: chrono::Utc::now().to_rfc3339(),
         nbd_unit: Some(nbd_unit_name.clone()),
         nbd_port: Some(nbd_port),
+        ..vm
     };
     metadata.save()?;
 
@@ -344,45 +456,75 @@ fn run_vfkit(opts: RunEphemeralOpts) -> Result<()> {
     Ok(())
 }
 
+/// Start a VM in the background: in a bcvk process of its own, which runs
+/// it in the foreground and cleans up after it.
+///
+/// The VM's name is reserved before that process starts, and it takes the
+/// name over, so that this one never writes the metadata the other may
+/// have written already.
 fn run_detached(opts: &RunEphemeralOpts) -> Result<()> {
-    let cache_base = ephemeral_base_dir();
-    fs::create_dir_all(&cache_base)?;
+    fs::create_dir_all(ephemeral_base_dir())?;
     let digest = ensure_image_and_get_digest(&opts.image)?;
     let digest_short = &digest[..16.min(digest.len())];
-    let vm_name = opts
-        .name
-        .clone()
-        .unwrap_or_else(|| format!("ephemeral-{}", &digest_short[..8]));
-    let log_path = cache_base.join(format!("bcvk-{}.log", vm_name));
-    let log_file = fs::File::create(&log_path)?;
+    let vm = reserve_vm_name(opts, digest_short)?;
+    let started = start_detached_child(opts, &vm);
+    if started.is_err() {
+        if let Err(e) = release_reservation(&vm) {
+            tracing::warn!("failed to release VM name '{}': {e}", vm.name);
+        }
+    }
+    started?;
+    println!("{}", vm.name);
+    Ok(())
+}
 
+/// Remove the metadata of a VM whose name this process reserved, unless
+/// another process took the name over since; if that process is gone
+/// already, release what it left, see [`crate::ephemeral_macos::release`].
+fn release_reservation(vm: &EphemeralVmMetadata) -> Result<()> {
+    let _lock = EphemeralVmMetadata::lock()?;
+    match EphemeralVmMetadata::load_if_exists(&vm.name)? {
+        Some(cur) if cur.owner == vm.owner => EphemeralVmMetadata::remove(&vm.name),
+        Some(cur) if cur.same_vm(vm) && !cur.is_alive() => crate::ephemeral_macos::release(&cur),
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Start the bcvk process running a detached VM, and wait for it to take
+/// over the VM's name; on failure, that process is stopped.
+fn start_detached_child(opts: &RunEphemeralOpts, vm: &EphemeralVmMetadata) -> Result<()> {
+    let log_path = vm
+        .log_path
+        .as_deref()
+        .ok_or_else(|| color_eyre::eyre::eyre!("no log file for VM '{}'", vm.name))?;
+    let log_file = fs::File::create(log_path).with_context(|| format!("creating {log_path}"))?;
     let exe = std::env::current_exe()?;
     let child = Command::new(exe)
-        .args(detached_child_args(opts, &vm_name))
+        .args(detached_child_args(opts, &vm.name))
         .stdin(Stdio::null())
         .stdout(log_file.try_clone()?)
         .stderr(log_file)
         .spawn()?;
-
-    let metadata = EphemeralVmMetadata {
-        name: vm_name.clone(),
-        image: opts.image.clone(),
-        vfkit: TrackedProcess::new(child.id()),
-        gvproxy: TrackedProcess::NONE,
-        ssh_port: 0,
-        ssh_key: cache_base
-            .join(format!("{}-key", vm_name))
-            .to_string_lossy()
-            .to_string(),
-        serial_log: String::new(),
-        log_path: Some(log_path.to_string_lossy().to_string()),
-        created: chrono::Utc::now().to_rfc3339(),
-        nbd_unit: None,
-        nbd_port: None,
-    };
-    metadata.save()?;
-    println!("{}", vm_name);
-    Ok(())
+    let child = TrackedProcess::new(child.id());
+    let taken_over =
+        crate::utils::wait_for_readiness(
+            indicatif::ProgressBar::hidden(),
+            "Waiting for the VM's bcvk process",
+            || {
+                if !child.is_running() {
+                    bail!("bcvk failed to start the VM, see {log_path}");
+                }
+                Ok(EphemeralVmMetadata::load_if_exists(&vm.name)?
+                    .is_some_and(|cur| cur.owner == child))
+            },
+            DETACHED_TAKEOVER_TIMEOUT,
+            Duration::from_millis(50),
+        );
+    if taken_over.is_err() {
+        crate::vm_helpers::terminate_process(child, "bcvk", Duration::ZERO, true);
+    }
+    taken_over.map(|_| ())
 }
 
 /// The command line of the bcvk process running a detached VM: the same
@@ -409,10 +551,12 @@ fn detached_child_args(opts: &RunEphemeralOpts, vm_name: &str) -> Vec<String> {
         gui: _,
         detach: _,
         debug,
+        detached_child: _,
     } = opts;
     let mut args: Vec<String> = vec![
         "ephemeral".into(),
         "run".into(),
+        "--detached-child".into(),
         "--ssh-keygen".into(),
         format!("--name={vm_name}"),
         format!("--memory={memory}"),
@@ -471,7 +615,10 @@ mod tests {
                 std::iter::once("run").chain(args[2..].iter().map(|a| a.as_str())),
             )
             .unwrap();
-            assert!(!child.detach && child.ssh_keygen, "{args:?}");
+            assert!(
+                !child.detach && child.detached_child && child.ssh_keygen,
+                "{args:?}"
+            );
             assert_eq!(child.name.as_deref(), Some("vm-1"));
             assert_eq!(child.image, opts.image);
             assert_eq!(child.size.memory.memory, opts.size.memory.memory);
@@ -483,11 +630,146 @@ mod tests {
         }
     }
 
+    fn parse_opts(args: &[&str]) -> RunEphemeralOpts {
+        RunEphemeralOpts::try_parse_from(std::iter::once("run").chain(args.iter().copied()))
+            .unwrap()
+    }
+
+    #[test]
+    fn test_reserve_vm_name() {
+        let _dir = crate::vm_helpers::use_test_base_dir();
+        let digest = "0123456789abcdef";
+        let reserve = |args: &[&str]| reserve_vm_name(&parse_opts(args), digest);
+
+        // This process holds each name it reserves: the default one gets
+        // numbered, a --name is refused
+        let first = reserve(&["img"]).unwrap();
+        assert_eq!(first.name, "ephemeral-01234567");
+        assert_eq!(first.owner, TrackedProcess::current());
+        assert!(first.log_path.is_none());
+        let second = reserve(&["-d", "img"]).unwrap();
+        assert_eq!(second.name, "ephemeral-01234567-2");
+        assert!(second.log_path.is_some());
+        for vm in [&first, &second] {
+            assert!(EphemeralVmMetadata::load(&vm.name).unwrap().same_vm(vm));
+        }
+        let err = reserve(&["--name", "ephemeral-01234567", "img"]).unwrap_err();
+        assert!(err.to_string().contains("already running"), "{err}");
+
+        // A VM that is gone gives up its name
+        EphemeralVmMetadata {
+            owner: TrackedProcess::NONE,
+            ..EphemeralVmMetadata::reserved("gone", "img", false)
+        }
+        .save()
+        .unwrap();
+        let mine = reserve(&["--name", "gone", "img"]).unwrap();
+        assert_eq!(EphemeralVmMetadata::load("gone").unwrap().owner, mine.owner);
+
+        // Metadata that can't be read isn't taken for a VM that is gone
+        std::fs::write(
+            EphemeralVmMetadata::metadata_path("legacy").unwrap(),
+            r#"{"name": "legacy", "pid": 12}"#,
+        )
+        .unwrap();
+        assert!(reserve(&["--name", "legacy", "img"]).is_err());
+    }
+
+    #[test]
+    fn test_take_over_vm_name() {
+        let _dir = crate::vm_helpers::use_test_base_dir();
+        // Not reserved at all
+        assert!(take_over_vm_name("vm").is_err());
+        // Reserved by another process than this one's parent
+        let mut vm = EphemeralVmMetadata::reserved("vm", "img", true);
+        vm.save().unwrap();
+        assert!(take_over_vm_name("vm").is_err());
+
+        vm.owner = TrackedProcess::new(std::os::unix::process::parent_id());
+        vm.save().unwrap();
+        let taken = take_over_vm_name("vm").unwrap();
+        assert_eq!(taken.owner, TrackedProcess::current());
+        let saved = EphemeralVmMetadata::load("vm").unwrap();
+        assert!(saved.same_vm(&vm));
+        assert_eq!(saved.owner, TrackedProcess::current());
+        // Only once
+        assert!(take_over_vm_name("vm").is_err());
+    }
+
+    #[test]
+    fn test_release_reservation() {
+        let _dir = crate::vm_helpers::use_test_base_dir();
+        let vm = EphemeralVmMetadata::reserved("vm", "img", true);
+        vm.save().unwrap();
+        release_reservation(&vm).unwrap();
+        assert!(EphemeralVmMetadata::load_if_exists("vm").unwrap().is_none());
+
+        // Taken over by a process that is still running, or by a new VM
+        let child = EphemeralVmMetadata {
+            owner: TrackedProcess::new(std::os::unix::process::parent_id()),
+            ..vm.clone()
+        };
+        let new_vm = EphemeralVmMetadata {
+            owner: TrackedProcess::NONE,
+            created: "2999-01-01T00:00:00Z".into(),
+            ..vm.clone()
+        };
+        for other in [&child, &new_vm] {
+            other.save().unwrap();
+            release_reservation(&vm).unwrap();
+            assert_eq!(EphemeralVmMetadata::load("vm").unwrap().owner, other.owner);
+        }
+        // Taken over by a process that is gone
+        EphemeralVmMetadata {
+            owner: TrackedProcess::NONE,
+            ..vm.clone()
+        }
+        .save()
+        .unwrap();
+        release_reservation(&vm).unwrap();
+        assert!(EphemeralVmMetadata::load_if_exists("vm").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_reserved_metadata() {
+        let vm = EphemeralVmMetadata::reserved("vm-1", "quay.io/img:1", true);
+        // Held by this process, which is running
+        assert_eq!(vm.owner, TrackedProcess::current());
+        assert!(vm.is_alive());
+        assert_eq!(vm.vfkit, TrackedProcess::NONE);
+        let base = ephemeral_base_dir();
+        assert_eq!(vm.ssh_key, base.join("vm-1-key").to_string_lossy());
+        assert_eq!(
+            vm.log_path.as_deref(),
+            Some(&*base.join("bcvk-vm-1.log").to_string_lossy())
+        );
+        assert!(EphemeralVmMetadata::reserved("vm-1", "img", false)
+            .log_path
+            .is_none());
+
+        assert!(vm.same_vm(&vm.clone()));
+        let later = EphemeralVmMetadata {
+            created: "2999-01-01T00:00:00Z".into(),
+            ..vm.clone()
+        };
+        assert!(!vm.same_vm(&later));
+        // Neither its bcvk process nor vfkit runs
+        let gone = EphemeralVmMetadata {
+            owner: TrackedProcess::NONE,
+            ..vm
+        };
+        assert!(!gone.is_alive());
+    }
+
     #[test]
     fn test_ephemeral_vm_metadata_roundtrip() {
         let meta = EphemeralVmMetadata {
             name: "test-vm".to_string(),
             image: "quay.io/fedora/fedora-bootc:42".to_string(),
+            owner: TrackedProcess {
+                pid: 12344,
+                started_us: 1_777_000_000_000_000,
+            },
             vfkit: TrackedProcess {
                 pid: 12345,
                 started_us: 1_777_000_000_000_000,
@@ -508,6 +790,7 @@ mod tests {
         let loaded: EphemeralVmMetadata = serde_json::from_str(&json).unwrap();
         assert_eq!(loaded.name, "test-vm");
         assert_eq!(loaded.image, "quay.io/fedora/fedora-bootc:42");
+        assert_eq!(loaded.owner, meta.owner);
         assert_eq!(loaded.vfkit, meta.vfkit);
         assert_eq!(loaded.gvproxy, meta.gvproxy);
         assert_eq!(loaded.nbd_unit.as_deref(), Some("bcvk-nbd-test-vm"));
@@ -522,6 +805,7 @@ mod tests {
         let meta = EphemeralVmMetadata {
             name: "roundtrip-vm".to_string(),
             image: "localhost/test:latest".to_string(),
+            owner: TrackedProcess::NONE,
             vfkit: TrackedProcess::NONE,
             gvproxy: TrackedProcess::NONE,
             ssh_port: 2250,
@@ -549,6 +833,7 @@ mod tests {
             let meta = EphemeralVmMetadata {
                 name: format!("vm-{i}"),
                 image: "test:latest".to_string(),
+                owner: TrackedProcess::NONE,
                 vfkit: TrackedProcess::NONE,
                 gvproxy: TrackedProcess::NONE,
                 ssh_port: 2222 + (i as u16),

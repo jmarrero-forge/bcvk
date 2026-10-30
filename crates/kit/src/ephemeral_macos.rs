@@ -1,6 +1,7 @@
 //! Ephemeral VM management commands for macOS (vfkit backend).
 
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use clap::Subcommand;
 use color_eyre::eyre::bail;
@@ -82,12 +83,14 @@ impl EphemeralCommands {
 
 /// Stop what is left of an ephemeral VM and forget it.
 ///
-/// Its processes are killed outright, as its root is a read-only export.
-/// The VM must go before the NBD server backing its root filesystem.
-/// gvproxy and the NBD server outlive a VM whose bcvk process didn't
-/// clean up after it (it was killed, say), so they are stopped even when
-/// vfkit has exited.
-fn release(vm: &EphemeralVmMetadata) {
+/// Its processes are killed outright, as its root is a read-only export,
+/// its bcvk process first, so that it doesn't start anything more. The
+/// VM must go before the NBD server backing its root filesystem. gvproxy
+/// and the NBD server outlive a VM whose bcvk process didn't clean up
+/// after it (it was killed, say), so they are stopped even when vfkit has
+/// exited.
+pub(crate) fn release(vm: &EphemeralVmMetadata) {
+    crate::vm_helpers::terminate_process(vm.owner, "bcvk", Duration::ZERO, true);
     crate::vm_helpers::stop_vm_processes(vm.vfkit, vm.gvproxy, true);
     if let Some(ref name) = vm.nbd_unit {
         crate::nbd_macos::stop_nbd_server(name, vm.nbd_port);
@@ -95,11 +98,29 @@ fn release(vm: &EphemeralVmMetadata) {
     EphemeralVmMetadata::remove(&vm.name);
 }
 
+/// Release a VM found gone, see [`release`], if it still is: under the
+/// VM names lock, and only if its name wasn't taken by a new VM since,
+/// whose resources this would release instead.
+fn release_if_gone(vm: &EphemeralVmMetadata) {
+    let release_it = || -> Result<()> {
+        let _lock = EphemeralVmMetadata::lock()?;
+        if let Some(cur) = EphemeralVmMetadata::load_if_exists(&vm.name)? {
+            if cur.same_vm(vm) && !cur.is_alive() {
+                release(&cur);
+            }
+        }
+        Ok(())
+    };
+    if let Err(e) = release_it() {
+        tracing::warn!("failed to release ephemeral VM '{}': {e}", vm.name);
+    }
+}
+
 fn cmd_ps(json: bool) -> Result<()> {
     let (live, stale): (Vec<_>, Vec<_>) = EphemeralVmMetadata::list_readable()?
         .into_iter()
         .partition(|vm| vm.is_alive());
-    stale.iter().for_each(release);
+    stale.iter().for_each(release_if_gone);
 
     if json {
         println!("{}", serde_json::to_string_pretty(&live)?);
@@ -113,6 +134,10 @@ fn cmd_ps(json: bool) -> Result<()> {
 
     println!("{:<24} {:<50} SSH", "NAME", "IMAGE");
     for vm in &live {
+        if !vm.vfkit.is_running() {
+            println!("{:<24} {:<50} (starting)", vm.name, vm.image);
+            continue;
+        }
         println!(
             "{:<24} {:<50} ssh -p {} -i {} root@{}",
             vm.name,
@@ -188,8 +213,11 @@ fn cmd_rm_all(force: bool) -> Result<()> {
 fn cmd_ssh(name: &str, args: &[String]) -> Result<()> {
     let vm = EphemeralVmMetadata::load(name)?;
     if !vm.is_alive() {
-        release(&vm);
+        release_if_gone(&vm);
         bail!("VM '{}' is not running", name);
+    }
+    if !vm.vfkit.is_running() {
+        bail!("VM '{}' is still starting", name);
     }
 
     // Try to set up SSH port forwarding via VM-specific gvproxy socket

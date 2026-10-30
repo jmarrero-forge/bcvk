@@ -450,6 +450,9 @@ pub fn find_vfkit() -> Result<String> {
 /// backend, see [`VmMetadataStore::parse`].
 const LEGACY_PID_KEYS: &[&str] = &["pid", "vfkit_pid", "gvproxy_pid"];
 
+/// Lock file in a VMs directory, see [`VmMetadataStore::lock`].
+const VMS_DIR_LOCK: &str = ".lock";
+
 /// Shared persistence methods for VM metadata types.
 ///
 /// Implementors provide `vms_dir()` and `name()`, getting JSON-backed
@@ -484,6 +487,28 @@ pub trait VmMetadataStore: serde::Serialize + serde::de::DeserializeOwned + Size
         file.persist(&path)
             .with_context(|| format!("writing {}", path.display()))?;
         Ok(())
+    }
+
+    /// Lock the VMs directory against other bcvk processes doing the same,
+    /// until the returned file is closed.
+    ///
+    /// Choosing a name for a new VM, and releasing what a VM that is gone
+    /// left under its name, happen under this lock, so that two processes
+    /// can't take one name, nor one release resources that another just
+    /// started under that name.
+    fn lock() -> color_eyre::Result<std::fs::File> {
+        let dir = Self::vms_dir();
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(VMS_DIR_LOCK);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        file.lock()
+            .with_context(|| format!("locking {}", path.display()))?;
+        Ok(file)
     }
 
     /// Load metadata for the named VM from its JSON file.
@@ -676,6 +701,11 @@ impl TrackedProcess {
         started_us: 0,
     };
 
+    /// This process.
+    pub fn current() -> Self {
+        Self::new(std::process::id())
+    }
+
     /// Track a process just started, such as a [`std::process::Child`].
     pub fn new(pid: u32) -> Self {
         match process_start_time(pid) {
@@ -744,7 +774,7 @@ fn send_signal(pid: u32, what: &str, signal: rustix::process::Signal) {
 /// Does nothing once the process is gone, which, as its identity is
 /// checked before each signal, includes its PID belonging to another
 /// process by now.
-fn terminate_process(process: TrackedProcess, what: &str, timeout: Duration, force: bool) {
+pub fn terminate_process(process: TrackedProcess, what: &str, timeout: Duration, force: bool) {
     let pid = process.pid;
     if !process.is_running() {
         return;
@@ -1214,7 +1244,7 @@ mod tests {
     }
 
     #[test]
-    fn test_metadata_save() {
+    fn test_metadata_save_and_lock() {
         let dir = use_test_base_dir();
         assert_eq!(TestMetadata::load_if_exists("vm").unwrap(), None);
         for pid in [1, 2] {
@@ -1231,6 +1261,24 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(files, ["vm.json"]);
+
+        let lock = TestMetadata::lock().unwrap();
+        let path = dir.path().join(VMS_DIR_LOCK);
+        let other = std::fs::File::open(&path).unwrap();
+        assert!(matches!(
+            other.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        drop(lock);
+        // A process that another test starts meanwhile holds a copy of
+        // the lock's descriptor until it execs, keeping it locked a moment
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while let Err(e) = other.try_lock() {
+            assert!(std::time::Instant::now() < deadline, "{e}");
+            std::thread::sleep(PROCESS_EXIT_POLL_INTERVAL);
+        }
+        // The lock file isn't metadata
+        assert_eq!(TestMetadata::list_readable().unwrap().len(), 1);
     }
 
     #[test]
