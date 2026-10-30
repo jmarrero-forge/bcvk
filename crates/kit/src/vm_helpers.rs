@@ -468,10 +468,20 @@ pub trait VmMetadataStore: serde::Serialize + serde::de::DeserializeOwned + Size
     }
 
     /// Save metadata to a JSON file in the VMs directory.
+    ///
+    /// The file is replaced in one step, so that another bcvk process
+    /// reading it meanwhile never sees it half written.
     fn save(&self) -> color_eyre::Result<()> {
+        use std::io::Write as _;
         let path = Self::metadata_path(self.name())?;
-        std::fs::create_dir_all(Self::vms_dir())?;
-        std::fs::write(&path, serde_json::to_string_pretty(self)?)
+        let dir = Self::vms_dir();
+        std::fs::create_dir_all(&dir)?;
+        let mut file = tempfile::NamedTempFile::new_in(&dir)
+            .with_context(|| format!("creating a file in {}", dir.display()))?;
+        file.write_all(serde_json::to_string_pretty(self)?.as_bytes())
+            .and_then(|()| file.as_file().sync_all())
+            .with_context(|| format!("writing {}", file.path().display()))?;
+        file.persist(&path)
             .with_context(|| format!("writing {}", path.display()))?;
         Ok(())
     }
@@ -567,11 +577,33 @@ pub(crate) fn read_all_metadata<T: VmMetadataStore>(
     Ok(items)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The [`bcvk_base_dir`] of the test running in this thread, if it set
+    /// one: tests run in threads of their own.
+    static TEST_BASE_DIR: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Base directory for bcvk persistent state: `~/.local/share/bcvk`.
 pub fn bcvk_base_dir() -> PathBuf {
+    #[cfg(test)]
+    if let Some(dir) = TEST_BASE_DIR.with_borrow(Clone::clone) {
+        return dir;
+    }
     dirs::home_dir()
         .expect("cannot determine home directory")
         .join(".local/share/bcvk")
+}
+
+/// Point [`bcvk_base_dir`] at a new temporary directory for the rest of
+/// the calling test; it is removed when the returned guard is dropped.
+#[cfg(test)]
+pub(crate) fn use_test_base_dir() -> tempfile::TempDir {
+    // Not in the long $TMPDIR of macOS, which socket paths would exceed
+    let dir = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
+    TEST_BASE_DIR.set(Some(dir.path().to_owned()));
+    dir
 }
 
 /// How long vfkit gets to exit after SIGTERM before it is killed.
@@ -1174,11 +1206,31 @@ mod tests {
 
     impl VmMetadataStore for TestMetadata {
         fn vms_dir() -> PathBuf {
-            unreachable!()
+            bcvk_base_dir()
         }
         fn name(&self) -> &str {
             &self.name
         }
+    }
+
+    #[test]
+    fn test_metadata_save() {
+        let dir = use_test_base_dir();
+        assert_eq!(TestMetadata::load_if_exists("vm").unwrap(), None);
+        for pid in [1, 2] {
+            let vm = TestMetadata {
+                name: "vm".into(),
+                vfkit: TrackedProcess { pid, started_us: 3 },
+            };
+            vm.save().unwrap();
+            assert_eq!(TestMetadata::load("vm").unwrap(), vm);
+        }
+        // No temporary files left behind
+        let files: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(files, ["vm.json"]);
     }
 
     #[test]
