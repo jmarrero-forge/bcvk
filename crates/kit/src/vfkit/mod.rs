@@ -155,6 +155,18 @@ impl VmMetadata {
     pub fn has_own_disk(&self) -> bool {
         Path::new(&self.disk_image).starts_with(Self::vms_dir())
     }
+
+    /// Save the metadata of a VM just launched, stopping it if that fails:
+    /// without its metadata, no other bcvk command could find it again.
+    pub fn save_or_stop(&self) -> Result<()> {
+        self.save().inspect_err(|_| {
+            tracing::warn!(
+                "saving the metadata of VM '{}' failed, stopping it",
+                self.name
+            );
+            self.stop_processes(false);
+        })
+    }
 }
 
 /// Whether [`launch`] starts a VM just created, which has no saved
@@ -255,7 +267,7 @@ pub(crate) fn launch(
             }
         }
         meta.state = "running".to_string();
-        meta.save()?;
+        meta.save_or_stop()?;
     }
 
     let connect = || -> Result<()> {
