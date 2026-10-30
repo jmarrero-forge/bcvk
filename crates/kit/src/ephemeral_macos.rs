@@ -1,6 +1,5 @@
 //! Ephemeral VM management commands for macOS (vfkit backend).
 
-use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use clap::Subcommand;
@@ -223,37 +222,79 @@ fn cmd_rm_all(force: bool) -> Result<()> {
         }
     }
 
-    // Sweep orphaned resources inside podman machine
-    if let Ok(machine) = crate::vm_helpers::detect_machine_name() {
-        // Stop orphaned bcvk-nbd systemd units
-        if let Err(e) = Command::new("podman")
-            .args([
-                "machine",
-                "ssh",
-                &machine,
-                "--",
-                "bash", "-c",
-                "for u in $(systemctl list-units --plain --no-legend 'bcvk-nbd-*' 2>/dev/null | awk '{print $1}'); do systemctl stop $u 2>/dev/null; systemctl reset-failed $u 2>/dev/null; done",
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-        {
-            tracing::debug!("failed to stop orphaned nbd units: {}", e);
-        }
-        // Unmount any remaining container image overlays
-        if let Err(e) = Command::new("podman")
-            .args([
-                "machine", "ssh", &machine, "--", "podman", "image", "umount", "--all",
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-        {
-            tracing::debug!("failed to unmount container images: {}", e);
+    if let Err(e) = sweep_orphans() {
+        tracing::warn!("failed to clean up after removed ephemeral VMs: {e}");
+    }
+    Ok(())
+}
+
+/// Stop the NBD servers, and unmount the images, that no ephemeral VM
+/// uses any more, such as those of one whose bcvk process was killed.
+///
+/// Those of a VM that is alive, which another bcvk process may have
+/// started after rm-all listed the VMs, are spared, as are those of a VM
+/// whose metadata can't be read, as it might be. Under the VM names lock,
+/// so that no VM can start under a name meanwhile; each podman machine
+/// command is bounded by [`crate::vm_helpers::MACHINE_SSH_TIMEOUT`], so
+/// that the lock isn't held for good.
+fn sweep_orphans() -> Result<()> {
+    let machine = crate::vm_helpers::detect_machine_name()?;
+    let _lock = EphemeralVmMetadata::lock()?;
+    let in_use: Vec<String> = crate::vm_helpers::read_all_metadata::<EphemeralVmMetadata>(
+        &EphemeralVmMetadata::vms_dir(),
+    )?
+    .into_iter()
+    .filter(|(_, meta)| meta.as_ref().map_or(true, EphemeralVmMetadata::is_alive))
+    .filter_map(|(path, _)| Some(path.file_stem()?.to_string_lossy().into_owned()))
+    .collect();
+
+    // Each command bounded, as a hung podman machine would otherwise keep
+    // every ephemeral VM from starting, waiting for the lock
+    let timeout = crate::vm_helpers::MACHINE_SSH_TIMEOUT;
+    let units = crate::vm_helpers::machine_ssh_output_within(&machine, NBD_UNITS_CMD, timeout)?;
+    if !units.status.success() {
+        bail!(
+            "listing the NBD servers failed: {}",
+            String::from_utf8_lossy(&units.stderr).trim()
+        );
+    }
+    for unit in orphaned_nbd_units(&String::from_utf8_lossy(&units.stdout), &in_use) {
+        crate::vm_helpers::stop_nbd_unit_within(&machine, unit, timeout)?;
+    }
+    // Image mounts aren't per VM
+    if in_use.is_empty() {
+        let umount = crate::vm_helpers::machine_ssh_output_within(
+            &machine,
+            "podman image umount --all",
+            timeout,
+        )?;
+        if !umount.status.success() {
+            tracing::debug!(
+                "failed to unmount container images: {}",
+                String::from_utf8_lossy(&umount.stderr).trim()
+            );
         }
     }
     Ok(())
+}
+
+/// Lists the NBD server units in the podman machine, one per line, the
+/// unit's name first.
+const NBD_UNITS_CMD: &str = "systemctl list-units --plain --no-legend 'bcvk-nbd-*'";
+
+/// The units in `units`, the output of [`NBD_UNITS_CMD`], that aren't the
+/// NBD server of a VM in `in_use`.
+fn orphaned_nbd_units<'a>(units: &'a str, in_use: &[String]) -> Vec<&'a str> {
+    units
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|unit| {
+            let unit = unit.strip_suffix(".service").unwrap_or(unit);
+            !in_use
+                .iter()
+                .any(|name| crate::nbd_macos::nbd_unit_name(name) == unit)
+        })
+        .collect()
 }
 
 fn cmd_ssh(name: &str, args: &[String]) -> Result<()> {
@@ -352,5 +393,33 @@ mod tests {
         new_vm.save().unwrap();
         remove(&vm(TrackedProcess::NONE)).unwrap();
         assert!(EphemeralVmMetadata::load("vm").unwrap().same_vm(&new_vm));
+    }
+
+    #[test]
+    fn test_orphaned_nbd_units() {
+        let units = "bcvk-nbd-a.service loaded active running /usr/bin/bcvk-nbd\n\
+                     bcvk-nbd-a-2.service loaded failed failed /usr/bin/bcvk-nbd\n\
+                     bcvk-nbd-b.service loaded active running /usr/bin/bcvk-nbd\n\
+                     \n";
+        for (in_use, orphaned) in [
+            (
+                &[][..],
+                &[
+                    "bcvk-nbd-a.service",
+                    "bcvk-nbd-a-2.service",
+                    "bcvk-nbd-b.service",
+                ][..],
+            ),
+            (
+                &["a".to_string()][..],
+                &["bcvk-nbd-a-2.service", "bcvk-nbd-b.service"][..],
+            ),
+            (
+                &["a-2".to_string(), "b".to_string()][..],
+                &["bcvk-nbd-a.service"][..],
+            ),
+        ] {
+            assert_eq!(orphaned_nbd_units(units, in_use), orphaned, "{in_use:?}");
+        }
     }
 }

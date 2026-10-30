@@ -278,6 +278,81 @@ pub fn machine_ssh_output(machine: &str, cmd: &str) -> Result<std::process::Outp
         .context("podman machine ssh")
 }
 
+/// A timeout for [`machine_ssh_output_within`] that covers stopping a
+/// unit: longer than systemd's default stop timeout of 90 seconds.
+pub(crate) const MACHINE_SSH_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Run a command inside the podman machine via SSH and capture output,
+/// like [`machine_ssh_output`], failing if it takes longer than
+/// `timeout`, for callers that must not hang with a hung podman machine.
+pub fn machine_ssh_output_within(
+    machine: &str,
+    cmd: &str,
+    timeout: Duration,
+) -> Result<std::process::Output> {
+    let mut command = Command::new("podman");
+    command.args(["machine", "ssh", machine, "--", cmd]);
+    output_within(command, "podman machine ssh", timeout)
+}
+
+/// Run `command` and capture its output, killing it, and what it started,
+/// if it hasn't exited after `timeout`.
+fn output_within(
+    mut command: Command,
+    what: &str,
+    timeout: Duration,
+) -> Result<std::process::Output> {
+    use std::io::{Read as _, Seek as _};
+    use std::os::unix::process::CommandExt as _;
+
+    // Files rather than pipes, which a process it started and that
+    // outlives it would keep open
+    let mut stdout = tempfile::tempfile()?;
+    let mut stderr = tempfile::tempfile()?;
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(stdout.try_clone()?)
+        .stderr(stderr.try_clone()?)
+        // Its own process group, to kill along with it what it started,
+        // such as podman machine ssh's ssh
+        .process_group(0)
+        .spawn()
+        .with_context(|| format!("running {what}"))?;
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .with_context(|| format!("waiting for {what}"))?
+        {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            // Not reaped yet, so its PID is still the group's
+            if let Some(group) = to_pid(child.id()) {
+                if let Err(e) =
+                    rustix::process::kill_process_group(group, rustix::process::Signal::KILL)
+                {
+                    tracing::debug!("killing {what}: {e}");
+                }
+            }
+            let _ = child.wait();
+            bail!("{what} didn't finish within {}s", timeout.as_secs());
+        }
+        std::thread::sleep(PROCESS_EXIT_POLL_INTERVAL);
+    };
+    let read = |file: &mut std::fs::File| -> Result<Vec<u8>> {
+        let mut data = Vec::new();
+        file.rewind()?;
+        file.read_to_end(&mut data)?;
+        Ok(data)
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: read(&mut stdout).with_context(|| format!("reading the output of {what}"))?,
+        stderr: read(&mut stderr).with_context(|| format!("reading the output of {what}"))?,
+    })
+}
+
 /// Get the merged overlay path from podman image mount.
 pub fn get_merged_path(machine: &str, rootful: bool, image: &str) -> Result<String> {
     let output = if rootful {
@@ -395,6 +470,16 @@ fn stop_unit_cmd(unit_name: &str) -> String {
         "systemctl stop {u} 2>/dev/null; systemctl reset-failed {u} 2>/dev/null",
         u = shell_escape(unit_name)
     )
+}
+
+/// Stop an NBD server systemd-run unit, failing only if the command
+/// can't be run, or doesn't finish within `timeout`.
+pub fn stop_nbd_unit_within(machine: &str, unit_name: &str, timeout: Duration) -> Result<()> {
+    let output = machine_ssh_output_within(machine, &stop_unit_cmd(unit_name), timeout)?;
+    if !output.status.success() {
+        tracing::debug!("stopping unit {unit_name} failed");
+    }
+    Ok(())
 }
 
 /// Stop an NBD server systemd-run unit (best-effort).
@@ -1327,6 +1412,61 @@ mod tests {
             );
         }
         assert!(TestMetadata::parse(path, "{").is_err());
+    }
+
+    #[test]
+    fn test_output_within() {
+        let sh = |script: &str| {
+            let mut command = Command::new("sh");
+            command.args(["-c", script]);
+            command
+        };
+        let output = output_within(
+            sh("echo out; echo err >&2; exit 3"),
+            "sh",
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        assert_eq!(
+            (output.status.code(), &output.stdout[..], &output.stderr[..]),
+            (Some(3), &b"out\n"[..], &b"err\n"[..])
+        );
+
+        // A command that hangs is killed, with what it started. On a
+        // loaded machine, the script may not get to write the PID of what
+        // it started (whole, hence the mv) before it is killed: then it is
+        // run again with a longer timeout.
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let script = format!(
+            "sleep 60 & echo $! > {0}.tmp && mv {0}.tmp {0}; wait",
+            pid_file.display()
+        );
+        let sleep: u32 = std::iter::successors(Some(Duration::from_millis(500)), |t| Some(*t * 2))
+            .take(5)
+            .find_map(|timeout| {
+                let start = std::time::Instant::now();
+                let err = output_within(sh(&script), "sh", timeout).unwrap_err();
+                assert!(err.to_string().contains("didn't finish within"), "{err}");
+                assert!(start.elapsed() < timeout + Duration::from_secs(30));
+                std::fs::read_to_string(&pid_file).ok()
+            })
+            .expect("the script never got to write the PID of sleep")
+            .trim()
+            .parse()
+            .unwrap();
+        // Reaped by launchd, not us
+        let gone = || {
+            matches!(
+                rustix::process::test_kill_process(to_pid(sleep).unwrap()),
+                Err(rustix::io::Errno::SRCH)
+            )
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !gone() && std::time::Instant::now() < deadline {
+            std::thread::sleep(PROCESS_EXIT_POLL_INTERVAL);
+        }
+        assert!(gone(), "sleep (PID {sleep}) still runs");
     }
 
     #[test]
