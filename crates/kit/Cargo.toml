@@ -43,6 +43,7 @@ oci-spec = "0.10.0"
 sha2 = "0.11"
 which = "8.0"
 cpio = "0.4"
+dialoguer = { version = "0.12", default-features = false }
 
 # Linux-only dependencies
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -58,6 +59,12 @@ libc = "0.2"
 zlink = "0.7"
 futures-util = "0.3"
 libsystemd = "0.7"
+
+# macOS-only dependencies (vfkit backend)
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+rustix = { version = "1", features = ["process"] }
+zstd = "0.13"
 
 [dev-dependencies]
 similar-asserts = "2.0"

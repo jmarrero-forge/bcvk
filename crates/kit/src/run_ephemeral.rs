@@ -106,17 +106,10 @@ use tracing::{debug, warn};
 
 const ENTRYPOINT: &str = "/var/lib/bcvk/entrypoint";
 
-/// Get default vCPU count (number of available processors, or 2 as fallback)
-pub fn default_vcpus() -> u32 {
-    std::thread::available_parallelism()
-        .map(|n| n.get() as u32)
-        .unwrap_or(2)
-}
-
 use crate::qemu::{self, QemuConfigExt};
 use crate::{
     boot_progress,
-    common_opts::MemoryOpts,
+    common_opts::VmSizeOpts,
     podman,
     supervisor_status::{StatusWriter, SupervisorState, SupervisorStatus},
     systemd, utils, CONTAINER_STATEDIR,
@@ -401,17 +394,9 @@ pub struct CommonPodmanOptions {
 /// Common VM configuration options for hardware, networking, and features.
 #[derive(Parser, Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CommonVmOpts {
-    #[clap(
-        long,
-        help = "Instance type (e.g., u1.nano, u1.small, u1.medium). Overrides vcpus/memory if specified."
-    )]
-    pub itype: Option<crate::instancetypes::InstanceType>,
-
     #[clap(flatten)]
-    pub memory: MemoryOpts,
-
-    #[clap(long, help = "Number of vCPUs (overridden by --itype if specified)")]
-    pub vcpus: Option<u32>,
+    #[serde(flatten)]
+    pub size: VmSizeOpts,
 
     #[clap(
         long,
@@ -476,20 +461,12 @@ pub struct CommonVmOpts {
 impl CommonVmOpts {
     /// Parse memory specification to MB, using instancetype if specified
     pub fn memory_mb(&self) -> color_eyre::Result<u32> {
-        if let Some(itype) = self.itype {
-            Ok(itype.memory_mb())
-        } else {
-            crate::utils::parse_memory_to_mb(&self.memory.memory)
-        }
+        self.size.memory_mb()
     }
 
     /// Get vCPU count, using instancetype if specified
     pub fn vcpus(&self) -> color_eyre::Result<u32> {
-        if let Some(itype) = self.itype {
-            Ok(itype.vcpus())
-        } else {
-            Ok(self.vcpus.unwrap_or_else(default_vcpus))
-        }
+        Ok(self.size.vcpus())
     }
 }
 
@@ -1775,23 +1752,10 @@ StandardOutput=file:/dev/virtio-ports/executestatus
     // virtiofs mount is handled solely by the sysroot.mount unit bcvk
     // injects into every initramfs via the CPIO append, together with the
     // initrd-root-fs.target.d/bcvk-sysroot.conf drop-in that wires it in.
-    let mut kernel_cmdline = [
-        // This avoids having journald interact with the rootfs
-        // at all, which lessens the I/O traffic for virtiofs
-        "systemd.mask=systemd-journal-flush.service",
-        // bootupd's automatic bootloader update needs a block device
-        // backing /boot or /sysroot, but here the root is virtiofs, so the
-        // unit fails and the system boots "degraded". Updating the
-        // bootloader makes no sense in an ephemeral VM anyway, and images
-        // will ship a bootupd without https://github.com/coreos/bootupd/pull/1072
-        // (which skips this case) for a long time.
-        "systemd.mask=bootloader-update.service",
-        // See https://github.com/bootc-dev/bcvk/issues/22
-        "selinux=0",
-    ]
-    .into_iter()
-    .map(ToOwned::to_owned)
-    .collect::<Vec<_>>();
+    let mut kernel_cmdline = crate::kernel_cmdline::EPHEMERAL_KERNEL_ARGS
+        .iter()
+        .map(|&arg| arg.to_owned())
+        .collect::<Vec<_>>();
 
     if opts.common.console {
         kernel_cmdline.push("console=hvc0".to_string());

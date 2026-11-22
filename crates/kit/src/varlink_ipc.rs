@@ -247,13 +247,15 @@ impl BcvkService {
             let run_opts = RunEphemeralOpts {
                 image,
                 common: CommonVmOpts {
-                    itype,
-                    memory: crate::common_opts::MemoryOpts {
-                        memory: opts
-                            .memory
-                            .unwrap_or_else(|| crate::common_opts::DEFAULT_MEMORY_USER_STR.into()),
+                    size: crate::common_opts::VmSizeOpts {
+                        itype,
+                        memory: crate::common_opts::MemoryOpts {
+                            memory: opts.memory.unwrap_or_else(|| {
+                                crate::common_opts::DEFAULT_MEMORY_USER_STR.into()
+                            }),
+                        },
+                        vcpus: opts.vcpus,
                     },
-                    vcpus: opts.vcpus,
                     console: opts.console.unwrap_or(false),
                     ssh_keygen: opts.ssh_keygen.unwrap_or(false),
                     ..Default::default()
@@ -373,8 +375,11 @@ impl BcvkService {
                     disk_size,
                     format,
                     common: crate::run_ephemeral::CommonVmOpts {
-                        memory: crate::common_opts::MemoryOpts {
-                            memory: crate::common_opts::DEFAULT_MEMORY_USER_STR.into(),
+                        size: crate::common_opts::VmSizeOpts {
+                            memory: crate::common_opts::MemoryOpts {
+                                memory: crate::common_opts::DEFAULT_MEMORY_USER_STR.into(),
+                            },
+                            ..Default::default()
                         },
                         ..Default::default()
                     },

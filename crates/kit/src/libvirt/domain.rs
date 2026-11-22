@@ -4,9 +4,9 @@
 //! for bootc containers, inspired by the podman-bootc domain builder pattern.
 
 use crate::arch::ArchConfig;
+use crate::common_opts::default_vcpus;
 use crate::common_opts::DEFAULT_MEMORY_USER_STR;
 use crate::libvirt::run::FirmwareType;
-use crate::run_ephemeral::default_vcpus;
 use crate::xml_utils::XmlWriter;
 use color_eyre::{eyre::eyre, Result};
 use std::collections::HashMap;

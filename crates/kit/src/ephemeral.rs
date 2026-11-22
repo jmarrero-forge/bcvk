@@ -388,14 +388,7 @@ fn remove_all_ephemeral_containers(force: bool) -> Result<()> {
             println!("  {} ({})", id, names);
         }
 
-        print!("Remove all ephemeral containers? [y/N]: ");
-        std::io::Write::flush(&mut std::io::stdout())?;
-
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input)?;
-        let input = input.trim().to_lowercase();
-
-        if input != "y" && input != "yes" {
+        if !crate::utils::confirm("Remove all ephemeral containers?")? {
             println!("Aborted.");
             return Ok(());
         }

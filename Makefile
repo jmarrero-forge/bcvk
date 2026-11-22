@@ -4,11 +4,21 @@ SOURCE_DATE_EPOCH ?= $(shell git log -1 --pretty=%ct)
 # https://reproducible-builds.org/docs/archives/
 TAR_REPRODUCIBLE = tar --mtime="@${SOURCE_DATE_EPOCH}" --sort=name --owner=0 --group=0 --numeric-owner --pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime
 
-all: bin manpages
+UNAME_S := $(shell uname -s)
 
+ifeq ($(UNAME_S),Linux)
+all: bin manpages
+else
+# The man pages document the Linux command line
+all: bin
+endif
+
+# The workspace check is Linux only: bcvk-nbd builds only for Linux
 .PHONY: bin
-bin:
+bin: nbd-server
+ifeq ($(UNAME_S),Linux)
 	cargo check --workspace
+endif
 	cargo build --release
 
 # Generate man pages from markdown sources
@@ -32,6 +42,7 @@ validate:
 	cargo fmt -- --check -l
 	cargo test --no-run --workspace
 	cargo clippy -- $(CLIPPY_CONFIG)
+	cargo clippy -p bcvk-nbd -- $(CLIPPY_CONFIG)
 	env RUSTDOCFLAGS='-D warnings' cargo doc --lib
 .PHONY: validate
 
@@ -57,4 +68,17 @@ update-manpages:
 
 update-generated: sync-manpages manpages
 
-.PHONY: all bin install manpages update-generated makesudoinstall sync-manpages update-manpages
+.PHONY: all bin install manpages update-generated makesudoinstall sync-manpages update-manpages nbd-server
+
+# Cross-compile NBD server for podman machine (needed on macOS/Windows, no-op on Linux)
+NBD_ARCH := $(shell rustc -vV | awk '/^host:/ {split($$2, a, "-"); print a[1]}')
+NBD_TARGET := $(NBD_ARCH)-unknown-linux-gnu
+
+.PHONY: nbd-server
+nbd-server:
+ifneq ($(UNAME_S),Linux)
+	PATH="$(HOME)/.rustup/toolchains/stable-$(shell rustc -vV | awk '/^host:/ {print $$2}')/bin:$(HOME)/.cargo/bin:$(PATH)" \
+	  cargo zigbuild --target $(NBD_TARGET) --release -p bcvk-nbd
+	mkdir -p target/nbd-server
+	cp target/$(NBD_TARGET)/release/bcvk-nbd target/nbd-server/bcvk-nbd
+endif

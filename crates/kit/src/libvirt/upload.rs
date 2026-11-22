@@ -213,8 +213,11 @@ pub fn run(global_opts: &crate::libvirt::LibvirtOptions, opts: LibvirtUploadOpts
         additional: ToDiskAdditionalOpts {
             disk_size: Some(disk_size.to_string()),
             common: crate::run_ephemeral::CommonVmOpts {
-                memory: opts.memory.clone(),
-                vcpus: opts.vcpus,
+                size: crate::common_opts::VmSizeOpts {
+                    memory: opts.memory.clone(),
+                    vcpus: opts.vcpus,
+                    ..Default::default()
+                },
                 ..Default::default()
             },
             ..Default::default()

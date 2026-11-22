@@ -116,8 +116,11 @@ fn create_base_disk(
                 .or(Some(super::LIBVIRT_DEFAULT_DISK_SIZE.to_string())),
             format: Format::Qcow2, // Use qcow2 for CoW cloning
             common: CommonVmOpts {
-                memory: crate::common_opts::MemoryOpts {
-                    memory: super::LIBVIRT_DEFAULT_MEMORY.to_string(),
+                size: crate::common_opts::VmSizeOpts {
+                    memory: crate::common_opts::MemoryOpts {
+                        memory: super::LIBVIRT_DEFAULT_MEMORY.to_string(),
+                    },
+                    ..Default::default()
                 },
                 virtiofsd_binary: virtiofsd_binary.map(String::from),
                 ..Default::default()
